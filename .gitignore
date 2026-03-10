@@ -1,19 +1,8 @@
-# Python
 __pycache__/
 *.py[cod]
-
-# Data
 *.tfrecords
-
-# Model checkpoints
 checkpoints/
-
-# MLflow
 mlflow.db
 mlruns/
-
-# Jupyter
 .ipynb_checkpoints/
-
-# PDF
 *.pdf
