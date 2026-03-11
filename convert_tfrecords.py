@@ -1,43 +1,38 @@
 """
-convert_tfrecords.py — Convert CLEVR-with-masks TFRecords to PNG images + masks.
+convert_tfrecords.py — Convert CLEVR-with-masks TFRecords to 64x64 PNGs.
 
 Reads the DeepMind Multi-Object Datasets CLEVR-with-masks TFRecords
-(GZIP compressed) and saves individual images and per-object segmentation
-masks as PNGs.
+(GZIP compressed) and saves resized images and per-object binary masks.
 
-TFRecord schema (per example):
-  - image:      bytes_list, 230400 entries (240*320*3 individual bytes) -> [240, 320, 3] uint8
-  - mask:       bytes_list, 844800 entries (11*240*320 individual bytes) -> [11, 240, 320] uint8 binary {0, 255}
-  - visibility: float_list, 11 values (1.0 = present, 0.0 = absent)
-  - color, material, shape, size: bytes_list, 11 entries (per-object attributes)
-  - x, y, z, rotation: float_list, 11 values (per-object 3D pose)
-  - pixel_coords: float_list, 33 values (11*3, per-object pixel coords + depth)
-
-Masks: channel 0 = background, channels 1-10 = foreground objects.
-Each channel is binary (0 or 255). We combine into a single segmentation map
-where pixel value = object ID (0=bg, 1..N=objects).
+Images are resized from 240x320 to 64x64 (bilinear).
+Masks are resized from 240x320 to 64x64 (nearest-neighbor) and saved as
+numpy arrays to preserve all 11 binary channels.
 
 Output structure:
-    CLEVR_masks/
+    CLEVR_64/
     ├── images/
     │   ├── train/
-    │   │   ├── 000000.png
+    │   │   ├── 000000.png      [64, 64, 3] uint8
     │   │   └── ...
     │   └── val/
-    │       ├── 000000.png
     │       └── ...
-    └── masks/
+    ├── masks/
+    │   ├── train/
+    │   │   ├── 000000.npy      [11, 64, 64] uint8 binary {0, 255}
+    │   │   └── ...
+    │   └── val/
+    │       └── ...
+    └── visibility/
         ├── train/
-        │   ├── 000000.png   (pixel values = object IDs: 0=bg, 1..N=objects)
+        │   ├── 000000.npy      [11] float32
         │   └── ...
         └── val/
-            ├── 000000.png
             └── ...
 
 Usage:
     python convert_tfrecords.py
-    python convert_tfrecords.py --input path/to/file.tfrecords --output CLEVR_masks
-    python convert_tfrecords.py --val_size 5000
+    python convert_tfrecords.py --input path/to/file.tfrecords --output CLEVR_64
+    python convert_tfrecords.py --resolution 128
 """
 
 import argparse
@@ -49,11 +44,7 @@ from PIL import Image
 
 
 def parse_example_proto(raw_record_bytes):
-    """Parse a single TFRecord example from raw bytes using protobuf directly.
-
-    This avoids needing tf.io.parse_single_example and handles the
-    bytes_list format used by Multi-Object Datasets.
-    """
+    """Parse a single TFRecord example from raw bytes using protobuf directly."""
     import tensorflow as tf
 
     example = tf.train.Example()
@@ -74,27 +65,18 @@ def parse_example_proto(raw_record_bytes):
     return image, masks, visibility
 
 
-def masks_to_segmentation(masks, visibility):
-    """Convert per-object binary masks to a single segmentation map.
+def resize_image(image, resolution):
+    """Resize [240, 320, 3] uint8 -> [res, res, 3] uint8 (bilinear)."""
+    return np.array(Image.fromarray(image).resize((resolution, resolution), Image.BILINEAR))
 
-    Args:
-        masks: [11, H, W] uint8 binary masks (0 or 255)
-        visibility: [11] float, 1.0 if object present
 
-    Returns:
-        seg: [H, W] uint8, pixel values = object ID (0=background, 1..10=objects)
-    """
-    H, W = masks.shape[1], masks.shape[2]
-    seg = np.zeros((H, W), dtype=np.uint8)
-
-    # masks[0] = background, masks[1..10] = objects
-    # later objects overwrite earlier ones at overlapping pixels (front-to-back)
-    for obj_idx in range(1, 11):
-        if visibility[obj_idx] > 0.5:
-            obj_mask = masks[obj_idx] > 127
-            seg[obj_mask] = obj_idx
-
-    return seg
+def resize_masks(masks, resolution):
+    """Resize [11, 240, 320] uint8 -> [11, res, res] uint8 (nearest)."""
+    out = np.zeros((11, resolution, resolution), dtype=np.uint8)
+    for i in range(11):
+        out[i] = np.array(Image.fromarray(masks[i]).resize(
+            (resolution, resolution), Image.NEAREST))
+    return out
 
 
 def convert(args):
@@ -105,14 +87,17 @@ def convert(args):
     input_path = args.input
     output_dir = Path(args.output)
     val_size = args.val_size
+    res = args.resolution
 
     print(f"Reading: {input_path}")
     print(f"Output:  {output_dir}")
+    print(f"Resolution: {res}x{res}")
 
     # create output directories
     for split in ['train', 'val']:
         (output_dir / 'images' / split).mkdir(parents=True, exist_ok=True)
         (output_dir / 'masks' / split).mkdir(parents=True, exist_ok=True)
+        (output_dir / 'visibility' / split).mkdir(parents=True, exist_ok=True)
 
     # read TFRecords (GZIP compressed)
     dataset = tf.data.TFRecordDataset(input_path, compression_type='GZIP')
@@ -136,8 +121,9 @@ def convert(args):
     for i, raw_record in enumerate(dataset):
         image, masks, visibility = parse_example_proto(raw_record.numpy())
 
-        # create segmentation map
-        seg = masks_to_segmentation(masks, visibility)
+        # resize to target resolution
+        image = resize_image(image, res)
+        masks = resize_masks(masks, res)
 
         # determine split
         if i < train_size:
@@ -149,28 +135,33 @@ def convert(args):
             idx = val_idx
             val_idx += 1
 
-        # save image
+        # save image as PNG
         img_path = output_dir / 'images' / split / f'{idx:06d}.png'
         Image.fromarray(image).save(img_path)
 
-        # save segmentation mask
-        mask_path = output_dir / 'masks' / split / f'{idx:06d}.png'
-        Image.fromarray(seg).save(mask_path)
+        # save masks as numpy (preserves all 11 binary channels)
+        mask_path = output_dir / 'masks' / split / f'{idx:06d}.npy'
+        np.save(mask_path, masks)
+
+        # save visibility as numpy
+        vis_path = output_dir / 'visibility' / split / f'{idx:06d}.npy'
+        np.save(vis_path, visibility)
 
         if (i + 1) % 5000 == 0:
             print(f"  [{i + 1:>6d}/{total}] processed")
 
     print(f"\nDone! Train: {train_idx}, Val: {val_idx}")
-    print(f"Images: {output_dir / 'images'}")
-    print(f"Masks:  {output_dir / 'masks'}")
+    print(f"Output: {output_dir}")
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Convert CLEVR-with-masks TFRecords to PNGs")
+    p = argparse.ArgumentParser(description="Convert CLEVR-with-masks TFRecords to resized PNGs + masks")
     p.add_argument("--input", default="clevr_with_masks_clevr_with_masks_train.tfrecords",
                    help="Path to .tfrecords file")
-    p.add_argument("--output", default="CLEVR_masks",
+    p.add_argument("--output", default="CLEVR_64",
                    help="Output directory")
+    p.add_argument("--resolution", type=int, default=64,
+                   help="Target resolution (default: 64)")
     p.add_argument("--val_size", type=int, default=5000,
                    help="Number of images for validation split")
     return p.parse_args()

@@ -37,31 +37,22 @@ In JAX, everything is functional — no mutation:
    This ensures reproducibility even under JIT.
 
 5. DATA LOADING:
-   We use tensorflow.data to read directly from CLEVR-with-masks TFRecords.
-   tf.data handles decompression, parsing, resizing, shuffling, and batching
-   in a pipelined fashion. Tensors are converted to JAX arrays per batch.
-
-================================================================================
-OPTAX SCHEDULE NOTES
-================================================================================
-
-optax.warmup_cosine_decay_schedule combines warmup + cosine decay:
-  - Linearly ramps lr from 0 to peak over `warmup_steps`
-  - Then cosine-decays to 0 over remaining steps
-This replaces PyTorch's LambdaLR + manual cosine function.
+   Pre-converted PNG images and numpy masks are loaded into RAM at startup.
+   Convert from TFRecords first: python convert_tfrecords.py
 
 ================================================================================
 
 Usage:
-    python train.py                       # full run with defaults
-    python train.py --total_steps 200     # quick smoke-test
-    python train.py --model baseline      # train baseline SA instead
+    python train.py --data_dir CLEVR_64       # full run with defaults
+    python train.py --total_steps 200         # quick smoke-test
+    python train.py --model baseline          # train baseline SA instead
     python train.py --resume checkpoints/best.eqx
 """
 
 import argparse
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import jax
@@ -69,6 +60,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 import numpy as np
+from PIL import Image
 
 import matplotlib
 matplotlib.use("Agg")
@@ -80,73 +72,59 @@ from model_baseline import SlotAttentionModel
 
 
 # ---------------------------------------------------------------------------
-# Dataset — TFRecords via tf.data
+# Dataset — preloaded PNGs + numpy masks
 # ---------------------------------------------------------------------------
 
-def build_tfrecord_dataset(tfrecords_path, resolution, batch_size, shuffle=True,
-                           shuffle_buffer=10000, skip=0, take=-1):
-    """Build a tf.data pipeline reading from CLEVR-with-masks TFRecords.
+class Dataset:
+    """Loads pre-converted PNGs + npy masks into RAM for fast training.
 
-    Returns batches of (images, masks, visibility):
-      images: [B, 3, H, W] float32 in [0, 1]
-      masks:  [B, 11, H, W] uint8 binary {0, 255}
-      visibility: [B, 11] float32
+    Expects output from convert_tfrecords.py:
+        data_dir/images/{split}/*.png     [H, W, 3] uint8
+        data_dir/masks/{split}/*.npy      [11, H, W] uint8
+        data_dir/visibility/{split}/*.npy [11] float32
+
+    Images are normalized to [-1, 1] NCHW at load time.
     """
-    import tensorflow as tf
+    def __init__(self, data_dir, split, batch_size, shuffle=True):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
 
-    def parse_fn(raw):
-        features = tf.io.parse_single_example(raw, {
-            'image': tf.io.VarLenFeature(tf.string),
-            'mask': tf.io.VarLenFeature(tf.string),
-            'visibility': tf.io.FixedLenFeature([11], tf.float32),
-        })
+        img_dir = Path(data_dir) / 'images' / split
+        mask_dir = Path(data_dir) / 'masks' / split
+        vis_dir = Path(data_dir) / 'visibility' / split
 
-        # image: join single-byte entries -> [240, 320, 3] -> resize -> CHW
-        img_str = tf.strings.reduce_join(
-            tf.sparse.to_dense(features['image'], default_value=b'\x00'))
-        image = tf.io.decode_raw(img_str, tf.uint8)
-        image = tf.cast(tf.reshape(image, [240, 320, 3]), tf.float32) / 127.5 - 1.0
-        image = tf.image.resize(image, [resolution, resolution])
-        image = tf.transpose(image, [2, 0, 1])  # [3, H, W]
+        self.img_files = sorted(img_dir.glob('*.png'))
+        self.mask_files = sorted(mask_dir.glob('*.npy'))
+        self.vis_files = sorted(vis_dir.glob('*.npy'))
+        self.n = len(self.img_files)
+        assert self.n > 0, f"No images found in {img_dir}"
+        assert len(self.mask_files) == self.n, "Image/mask count mismatch"
 
-        # mask: join -> [11, 240, 320] -> resize nearest -> [11, H, W]
-        mask_str = tf.strings.reduce_join(
-            tf.sparse.to_dense(features['mask'], default_value=b'\x00'))
-        mask = tf.io.decode_raw(mask_str, tf.uint8)
-        mask = tf.reshape(mask, [11, 240, 320])
-        mask_t = tf.transpose(mask, [1, 2, 0])  # [H, W, 11]
-        mask_t = tf.image.resize(mask_t, [resolution, resolution], method='nearest')
-        mask_t = tf.transpose(mask_t, [2, 0, 1])  # [11, H, W]
-        mask_t = tf.cast(mask_t, tf.uint8)
+        # determine resolution from first image
+        sample = np.array(Image.open(self.img_files[0]))
+        H, W = sample.shape[:2]
 
-        return image, mask_t, features['visibility']
+        # preload everything into RAM
+        print(f"  Loading {split}: {self.n} images ({H}x{W})...")
+        self.images = np.zeros((self.n, 3, H, W), dtype=np.float32)
+        self.masks = np.zeros((self.n, 11, H, W), dtype=np.uint8)
+        self.visibility = np.zeros((self.n, 11), dtype=np.float32)
+        for i in range(self.n):
+            img = np.array(Image.open(self.img_files[i]))  # [H, W, 3] uint8
+            self.images[i] = img.transpose(2, 0, 1).astype(np.float32) / 127.5 - 1.0
+            self.masks[i] = np.load(self.mask_files[i])
+            self.visibility[i] = np.load(self.vis_files[i])
+            if (i + 1) % 10000 == 0:
+                print(f"    {i + 1}/{self.n}")
+        print(f"  Done. ~{self.images.nbytes / 1e9:.1f} GB in RAM")
 
-    ds = tf.data.TFRecordDataset(tfrecords_path, compression_type='GZIP')
-    if skip > 0:
-        ds = ds.skip(skip)
-    if take > 0:
-        ds = ds.take(take)
-    ds = ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    if shuffle:
-        ds = ds.shuffle(shuffle_buffer)
-    ds = ds.batch(batch_size, drop_remainder=True)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
-
-
-def count_tfrecords(tfrecords_path):
-    """Count total records in a TFRecords file."""
-    import tensorflow as tf
-    ds = tf.data.TFRecordDataset(tfrecords_path, compression_type='GZIP')
-    count = 0
-    for _ in ds:
-        count += 1
-    return count
-
-
-def tf_to_jax(tensor):
-    """Convert TF tensor to JAX array (via numpy, zero-copy for CPU)."""
-    return jnp.array(tensor.numpy())
+    def __iter__(self):
+        idx = np.arange(self.n)
+        if self.shuffle:
+            np.random.shuffle(idx)
+        for start in range(0, self.n - self.batch_size + 1, self.batch_size):
+            sl = idx[start:start + self.batch_size]
+            yield self.images[sl], self.masks[sl], self.visibility[sl]
 
 
 # ---------------------------------------------------------------------------
@@ -164,13 +142,7 @@ def mse_loss(recon: jax.Array, target: jax.Array) -> jax.Array:
 
 @eqx.filter_jit
 def train_step(model, opt_state, optimizer, images, key):
-    """Single training step. Returns (model, opt_state, loss).
-
-    eqx.filter_jit automatically traces array leaves and treats
-    non-array fields (like num_slots, resolution) as static constants.
-
-    eqx.filter_grad differentiates only w.r.t. array leaves of `model`.
-    """
+    """Single training step. Returns (model, opt_state, loss)."""
 
     def loss_fn(model):
         recon, masks, slots = model(images, key=key)
@@ -201,13 +173,11 @@ def eval_step(model, images, key):
 def eval_loss(model, val_ds, key, max_batches=50):
     """Average validation loss over up to max_batches."""
     total, count = 0.0, 0
-    for batch in val_ds:
+    for imgs, _, _ in val_ds:
         if count >= max_batches:
             break
-        imgs, _, _ = batch
-        imgs_jax = tf_to_jax(imgs)
         key, subkey = jax.random.split(key)
-        loss = eval_step(model, imgs_jax, subkey)
+        loss = eval_step(model, jnp.array(imgs), subkey)
         total += float(loss)
         count += 1
     return total / max(1, count)
@@ -331,10 +301,8 @@ def parse_args():
     p.add_argument("--model",          default="slot_ode", choices=["slot_ode", "baseline"])
     p.add_argument("--solver",         default="tsit5", choices=["euler", "tsit5", "dopri5"],
                    help="ODE solver for slot_ode model (ignored for baseline)")
-    p.add_argument("--tfrecords",      default="clevr_with_masks_clevr_with_masks_train.tfrecords",
-                   help="Path to CLEVR-with-masks TFRecords file")
-    p.add_argument("--val_size",       type=int,   default=5000,
-                   help="Number of images held out for validation (last N records)")
+    p.add_argument("--data_dir",       default="CLEVR_64",
+                   help="Path to pre-converted dataset (from convert_tfrecords.py)")
     p.add_argument("--resolution",     type=int,   default=64,
                    help="Image resolution (both H and W)")
     p.add_argument("--batch_size",     type=int,   default=64)
@@ -356,7 +324,6 @@ def parse_args():
     p.add_argument("--run_name",       default=None)
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--grad_clip",      type=float, default=1.0)
-    p.add_argument("--shuffle_buffer", type=int,   default=10000)
     p.add_argument("--resume",         default=None,
                    help="Path to a .eqx checkpoint to resume from")
     p.add_argument("--gcs_ckpt",       default=None,
@@ -369,34 +336,16 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 def train(args):
-    import tensorflow as tf
-    # suppress TF warnings, we only use it for data loading
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
     print(f"JAX devices: {jax.devices()}")
 
     # ---- PRNG setup -------------------------------------------------------
     key = jax.random.key(args.seed)
     key, model_key = jax.random.split(key)
 
-    # ---- count dataset & split --------------------------------------------
-    print(f"Counting records in {args.tfrecords}...")
-    total = count_tfrecords(args.tfrecords)
-    train_size = total - args.val_size
-    print(f"Total: {total}  Train: {train_size}  Val: {args.val_size}")
-
     # ---- datasets ---------------------------------------------------------
     res = args.resolution
-    train_ds = build_tfrecord_dataset(
-        args.tfrecords, res, args.batch_size,
-        shuffle=True, shuffle_buffer=args.shuffle_buffer,
-        take=train_size,
-    )
-    val_ds = build_tfrecord_dataset(
-        args.tfrecords, res, args.batch_size,
-        shuffle=False,
-        skip=train_size, take=args.val_size,
-    )
+    train_ds = Dataset(args.data_dir, 'train', args.batch_size, shuffle=True)
+    val_ds = Dataset(args.data_dir, 'val', args.batch_size, shuffle=False)
 
     # ---- model ------------------------------------------------------------
     if args.model == "slot_ode":
@@ -449,9 +398,8 @@ def train(args):
 
     # ---- fixed batch for visualization ------------------------------------
     img_batch = None
-    for batch in train_ds.take(1):
-        imgs, _, _ = batch
-        img_batch = tf_to_jax(imgs)[:4]
+    for imgs, _, _ in train_ds:
+        img_batch = jnp.array(imgs[:4])
         break
 
     # ---- MLflow -----------------------------------------------------------
@@ -460,10 +408,10 @@ def train(args):
         mlflow.log_params(vars(args))
 
         done = False
+        _t0 = time.time()
         while not done:
-            for batch in train_ds:
-                imgs, _, _ = batch
-                imgs_jax = tf_to_jax(imgs)
+            for imgs, _, _ in train_ds:
+                imgs_jax = jnp.array(imgs)
 
                 key, subkey = jax.random.split(key)
 
@@ -475,8 +423,11 @@ def train(args):
 
                 # ---- logging ----------------------------------------------
                 if global_step % args.log_every == 0:
+                    _elapsed = time.time() - _t0
+                    _sps = _elapsed / args.log_every
+                    _t0 = time.time()
                     current_lr = float(schedule(global_step))
-                    print(f"[step {global_step:>7d}]  train_loss={loss_val:.5f}  lr={current_lr:.2e}")
+                    print(f"[step {global_step:>7d}]  loss={loss_val:.5f}  lr={current_lr:.2e}  {_sps:.3f}s/step")
                     mlflow.log_metrics(
                         {"train/loss": loss_val, "train/lr": current_lr},
                         step=global_step,
