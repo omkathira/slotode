@@ -270,8 +270,19 @@ def log_image_grid(model, imgs_jax, key, step):
 # Checkpointing
 # ---------------------------------------------------------------------------
 
+def _gcs_sync(local_path: str, gcs_dir: str):
+    """Upload a file to GCS. Logs warning on failure."""
+    import subprocess
+    dst = f"{gcs_dir.rstrip('/')}/{os.path.basename(local_path)}"
+    try:
+        subprocess.run(["gsutil", "-q", "cp", local_path, dst],
+                       check=True, timeout=120)
+    except Exception as e:
+        print(f"  WARNING: GCS sync failed for {local_path}: {e}")
+
+
 def save_checkpoint(path: str, model, opt_state, global_step: int,
-                    best_val_loss: float, args):
+                    best_val_loss: float, args, gcs_ckpt: str = None):
     """Save model + optimizer state using equinox serialization."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
@@ -286,6 +297,10 @@ def save_checkpoint(path: str, model, opt_state, global_step: int,
             'best_val_loss': best_val_loss,
             'args': vars(args),
         }, f)
+
+    if gcs_ckpt:
+        _gcs_sync(path, gcs_ckpt)
+        _gcs_sync(meta_path, gcs_ckpt)
 
 
 def load_checkpoint(path: str, model, optimizer):
@@ -344,6 +359,8 @@ def parse_args():
     p.add_argument("--shuffle_buffer", type=int,   default=10000)
     p.add_argument("--resume",         default=None,
                    help="Path to a .eqx checkpoint to resume from")
+    p.add_argument("--gcs_ckpt",       default=None,
+                   help="GCS path to sync checkpoints (e.g. gs://omkos-slotode/checkpoints)")
     return p.parse_args()
 
 
@@ -478,6 +495,7 @@ def train(args):
                             str(ckpt_dir / "best.eqx"),
                             model, opt_state,
                             global_step, best_val_loss, args,
+                            gcs_ckpt=args.gcs_ckpt,
                         )
                         print(f"  -> new best saved")
 
@@ -492,6 +510,7 @@ def train(args):
                         str(ckpt_dir / f"step_{global_step:07d}.eqx"),
                         model, opt_state,
                         global_step, best_val_loss, args,
+                        gcs_ckpt=args.gcs_ckpt,
                     )
                     print(f"[step {global_step:>7d}]  checkpoint saved")
 
