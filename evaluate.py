@@ -133,13 +133,14 @@ def iter_tfrecords(tfrecords_path, num_samples, val_offset=None):
 
 
 def iter_pngs(data_root, split, num_samples, resolution):
-    """Iterate over PNG image/mask pairs.
+    """Iterate over PNG images with .npy masks.
 
     Yields:
         (image, seg) where image is [H, W, 3] uint8, seg is [H, W] int32
     """
     img_dir = Path(data_root) / "images" / split
     mask_dir = Path(data_root) / "masks" / split
+    vis_dir = Path(data_root) / "visibility" / split
 
     if not img_dir.exists():
         raise FileNotFoundError(
@@ -149,12 +150,16 @@ def iter_pngs(data_root, split, num_samples, resolution):
 
     img_paths = sorted(img_dir.glob("*.png"))[:num_samples]
     for ip in img_paths:
-        mp = mask_dir / ip.name
+        stem = ip.stem
+        mp = mask_dir / f"{stem}.npy"
+        vp = vis_dir / f"{stem}.npy"
         if not mp.exists():
             continue
 
         img = np.array(Image.open(ip).convert('RGB'))
-        seg = np.array(Image.open(mp), dtype=np.int32)
+        masks = np.load(mp)  # [11, H, W] uint8
+        visibility = np.load(vp) if vp.exists() else np.ones(masks.shape[0], dtype=np.float32)
+        seg = masks_to_segmentation(masks, visibility)
         yield img, seg
 
 

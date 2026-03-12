@@ -50,28 +50,42 @@ class SoftPositionalEmbedding(eqx.Module):
 class SlotODEFunc(eqx.Module):
     """The ODE vector field: ds/dt = f(t, s, k, v).
 
-    Only the Q projection lives here — K, V are precomputed outside and
-    passed as `args` to the ODE solver. This matches the original Slot
-    Attention paper where K, V are computed once from input features.
+    Computes velocity by asking "where would one discrete Slot Attention
+    iteration send these slots?" and pointing toward that target:
+
+        target = GRU(attended, slots) + MLP(LayerNorm(gru_output))
+        velocity = target - slots
+
+    The GRU provides gated selective updates (matching the baseline's
+    inductive bias), while Tsit5 handles smooth temporal integration.
+    K, V are precomputed outside and passed as `args`.
     """
     to_q: eqx.nn.Linear       # [slot_dim -> slot_dim]
     norm_slots: eqx.nn.LayerNorm
-    dynamics_mlp_0: eqx.nn.Linear   # [slot_dim * 2 -> slot_dim * 2]
-    dynamics_mlp_1: eqx.nn.Linear   # [slot_dim * 2 -> slot_dim]
     scale: float
 
-    def __init__(self, slot_dim: int, *, key: jax.Array):
-        k1, k2, k3 = jax.random.split(key, 3)
+    # GRU for gated mixing of attended info with current slots
+    gru: eqx.nn.GRUCell
+
+    # residual MLP (applied after GRU, matching baseline structure)
+    norm_pre_ff: eqx.nn.LayerNorm
+    mlp_0: eqx.nn.Linear      # [slot_dim -> mlp_hidden]
+    mlp_1: eqx.nn.Linear      # [mlp_hidden -> slot_dim]
+
+    def __init__(self, slot_dim: int, mlp_hidden: int = 128, *, key: jax.Array):
+        k1, k2, k3, k4 = jax.random.split(key, 4)
         self.scale = slot_dim ** -0.5
 
         self.to_q = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k1)
         self.norm_slots = eqx.nn.LayerNorm(slot_dim)
 
-        # dynamics MLP: [slot || attended] -> velocity
-        # split into two layers so they're separate equinox leaves
-        # (eqx.nn.Sequential exists but explicit layers are clearer here)
-        self.dynamics_mlp_0 = eqx.nn.Linear(slot_dim * 2, slot_dim * 2, key=k2)
-        self.dynamics_mlp_1 = eqx.nn.Linear(slot_dim * 2, slot_dim, key=k3)
+        # GRU: input=attended (slot_dim), hidden=slots (slot_dim)
+        self.gru = eqx.nn.GRUCell(slot_dim, slot_dim, key=k2)
+
+        # residual MLP after GRU
+        self.norm_pre_ff = eqx.nn.LayerNorm(slot_dim)
+        self.mlp_0 = eqx.nn.Linear(slot_dim, mlp_hidden, key=k3)
+        self.mlp_1 = eqx.nn.Linear(mlp_hidden, slot_dim, key=k4)
 
     def __call__(self, t: float, slots: jax.Array, args: tuple) -> jax.Array:
         """
@@ -87,7 +101,6 @@ class SlotODEFunc(eqx.Module):
         k, v = args
 
         # normalize slots then compute Q
-        # vmap LayerNorm over batch and slot dims
         slots_norm = jax.vmap(jax.vmap(self.norm_slots))(slots)  # [B, N_slots, D]
         q = jax.vmap(jax.vmap(self.to_q))(slots_norm)            # [B, N_slots, D]
 
@@ -99,11 +112,18 @@ class SlotODEFunc(eqx.Module):
         # aggregate values
         attended = jnp.einsum('bnm,bmd->bnd', att, v)  # [B, N_slots, D]
 
-        # compute velocity: MLP([slot, attended])
-        combined = jnp.concatenate([slots, attended], axis=-1)  # [B, N_slots, 2*D]
-        h = jax.vmap(jax.vmap(self.dynamics_mlp_0))(combined)   # [B, N_slots, 2*D]
+        # GRU gated update: selectively mix attended info into slots
+        gru_out = jax.vmap(jax.vmap(self.gru))(attended, slots)  # [B, N_slots, D]
+
+        # residual MLP refinement
+        gru_normed = jax.vmap(jax.vmap(self.norm_pre_ff))(gru_out)
+        h = jax.vmap(jax.vmap(self.mlp_0))(gru_normed)
         h = jax.nn.relu(h)
-        velocity = jax.vmap(jax.vmap(self.dynamics_mlp_1))(h)   # [B, N_slots, D]
+        h = jax.vmap(jax.vmap(self.mlp_1))(h)
+        target = gru_out + h  # [B, N_slots, D]
+
+        # velocity points from current slots toward discrete-step target
+        velocity = target - slots
 
         return velocity
 
@@ -139,7 +159,7 @@ class SlotAttentionODE(eqx.Module):
     to_k: eqx.nn.Linear
     to_v: eqx.nn.Linear
 
-    # ODE dynamics (only has Q projection + MLP)
+    # ODE dynamics (Q projection + GRU + residual MLP)
     slot_ode_func: SlotODEFunc
 
     def __init__(self, num_slots: int, slot_dim: int, enc_dim: int,
