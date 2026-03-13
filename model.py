@@ -133,10 +133,8 @@ class SlotODEFunc(eqx.Module):
     This gives each Euler step distinct learned weights — equivalent to
     a multi-layer network where each "layer" has unique parameters.
     """
-    # time-dependent weight generators (each has own MLP+Proj head)
+    # time-dependent weight generators (Q and FF only — K, V are static)
     tdw_q: TimeDepWeight     # generates Q projection  [slot_dim, slot_dim]
-    tdw_k: TimeDepWeight     # generates K projection  [slot_dim, slot_dim]
-    tdw_v: TimeDepWeight     # generates V projection  [slot_dim, slot_dim]
     tdw_ff0: TimeDepWeight   # generates FF layer 0    [mlp_hidden, slot_dim]
     tdw_ff1: TimeDepWeight   # generates FF layer 1    [slot_dim, mlp_hidden]
 
@@ -149,17 +147,15 @@ class SlotODEFunc(eqx.Module):
 
     def __init__(self, slot_dim: int, mlp_hidden: int = 128,
                  d_emb: int = 64, *, key: jax.Array):
-        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        k1, k2, k3 = jax.random.split(key, 3)
         self.scale = slot_dim ** -0.5
         self.slot_dim = slot_dim
         self.mlp_hidden = mlp_hidden
 
-        # time-dependent weight generators (5 heads, shared sinusoidal freqs)
+        # time-dependent: Q and feedforward (slots' search strategy evolves)
         self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, key=k1)
-        self.tdw_k = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, key=k2)
-        self.tdw_v = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, key=k3)
-        self.tdw_ff0 = TimeDepWeight(slot_dim, mlp_hidden, d_emb=d_emb, key=k4)
-        self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, key=k5)
+        self.tdw_ff0 = TimeDepWeight(slot_dim, mlp_hidden, d_emb=d_emb, key=k2)
+        self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, key=k3)
 
         # static layer norms
         self.norm_attn = eqx.nn.LayerNorm(slot_dim)
@@ -169,26 +165,23 @@ class SlotODEFunc(eqx.Module):
         """
         Diffrax calls this as vector_field(t, y, args).
 
-        slots:    [B, N_slots, D]
-        args:     (features,) — projected encoder features
-          features: [B, N_feat, D]
+        slots:  [B, N_slots, D]
+        args:   (k, v) — static precomputed keys and values
+          k: [B, N_feat, D]
+          v: [B, N_feat, D]
 
-        returns:  velocity [B, N_slots, D]
+        returns: velocity [B, N_slots, D]
         """
-        features, = args
+        k, v = args
 
-        # generate all time-dependent weight matrices
+        # time-dependent Q and FF weights
         W_q = self.tdw_q(t)      # [D, D]
-        W_k = self.tdw_k(t)      # [D, D]
-        W_v = self.tdw_v(t)      # [D, D]
         W_ff0 = self.tdw_ff0(t)  # [mlp_hidden, D]
         W_ff1 = self.tdw_ff1(t)  # [D, mlp_hidden]
 
-        # --- f: cross-attention (slots query features) ---
+        # --- f: cross-attention (slots query fixed features) ---
         slots_norm = jax.vmap(jax.vmap(self.norm_attn))(slots)     # [B, N_slots, D]
         q = jnp.einsum('bnd,od->bno', slots_norm, W_q)             # [B, N_slots, D]
-        k = jnp.einsum('bmd,od->bmo', features, W_k)               # [B, N_feat, D]
-        v = jnp.einsum('bmd,od->bmo', features, W_v)               # [B, N_feat, D]
 
         att_logits = jnp.einsum('bnd,bmd->bnm', q, k) * self.scale  # [B, N_slots, N_feat]
         att = jax.nn.softmax(att_logits, axis=1)   # softmax over slots (competition)
@@ -233,13 +226,17 @@ class SlotAttentionODE(eqx.Module):
     norm_input: eqx.nn.LayerNorm
     fc_input: eqx.nn.Linear
 
-    # ODE dynamics (time-dependent Q, K, V, FF — no static projections needed)
+    # static K, V projections (scene description doesn't change during integration)
+    to_k: eqx.nn.Linear
+    to_v: eqx.nn.Linear
+
+    # ODE dynamics (time-dependent Q and FF only)
     slot_ode_func: SlotODEFunc
 
     def __init__(self, num_slots: int, slot_dim: int, enc_dim: int,
                  num_iter: int = 3, solver: str = "tsit5", *,
                  key: jax.Array):
-        k1, k2 = jax.random.split(key, 2)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -257,7 +254,11 @@ class SlotAttentionODE(eqx.Module):
         self.norm_input = eqx.nn.LayerNorm(enc_dim)
         self.fc_input = eqx.nn.Linear(enc_dim, slot_dim, key=k2)
 
-        # ODE dynamics (K, V projections are now inside via hypernetworks)
+        # static K, V projections (precomputed once per forward pass)
+        self.to_k = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k3)
+        self.to_v = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k4)
+
+        # ODE dynamics
         self.slot_ode_func = SlotODEFunc(slot_dim, key=key)
 
     def initialize_slots(self, batch_size: int, key: jax.Array) -> jax.Array:
@@ -283,9 +284,11 @@ class SlotAttentionODE(eqx.Module):
         """
         B = enc_feat.shape[0]
 
-        # project input features to slot_dim (K, V computed inside ODE via hypernetworks)
+        # project input features and precompute static K, V
         feat_norm = jax.vmap(jax.vmap(self.norm_input))(enc_feat)  # [B, N_feat, D_enc]
-        features = jax.vmap(jax.vmap(self.fc_input))(feat_norm)    # [B, N_feat, D_slot]
+        feat = jax.vmap(jax.vmap(self.fc_input))(feat_norm)        # [B, N_feat, D_slot]
+        k = jax.vmap(jax.vmap(self.to_k))(feat)                   # [B, N_feat, D_slot]
+        v = jax.vmap(jax.vmap(self.to_v))(feat)                   # [B, N_feat, D_slot]
 
         # initialize slots
         slots_0 = self.initialize_slots(B, key)  # [B, N_slots, D_slot]
@@ -318,7 +321,7 @@ class SlotAttentionODE(eqx.Module):
             t1=self.T,
             dt0=self.dt0,
             y0=slots_0,
-            args=(features,),
+            args=(k, v),
             saveat=saveat,
             stepsize_controller=stepsize_controller,
         )
