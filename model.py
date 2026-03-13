@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 import diffrax
+import math
 
 # soft positional embedding
 class SoftPositionalEmbedding(eqx.Module):
@@ -44,48 +45,114 @@ class SoftPositionalEmbedding(eqx.Module):
 
 
 # ---------------------------------------------------------------------------
-# SlotODE dynamics function
+# Time-dependent weight generation (DiffEqFormer-style hypernetwork)
+# ---------------------------------------------------------------------------
+
+class TimeDepWeight(eqx.Module):
+    """Generates a weight matrix W(t) as a function of continuous time t.
+
+    Architecture (following DiffEqFormer, Tong et al. 2025):
+        W(t) = Proj(MLP(Sinusoidal(t)))
+
+    - Sinusoidal: scalar t -> Concat(t, sin(w*t), cos(w*t)) with log-spaced
+      frequencies w, giving a rich multi-scale time representation.
+    - MLP: 2-layer network with SiLU activation.
+    - Proj: linear projection reshaped to (d_out, d_in) weight matrix.
+
+    Each weight matrix (Q, MLP_0, MLP_1) gets its own MLP+Proj head but
+    shares the same sinusoidal frequency vector (following Figure 17 left).
+    """
+    # fixed sinusoidal frequencies (not trainable)
+    freqs: jax.Array  # [n_freq]
+
+    # MLP: sinusoidal_dim -> d_emb -> d_emb
+    mlp_0: eqx.nn.Linear
+    mlp_1: eqx.nn.Linear
+
+    # projection: d_emb -> d_out * d_in
+    proj: eqx.nn.Linear
+
+    d_in: int = eqx.field(static=True)
+    d_out: int = eqx.field(static=True)
+
+    def __init__(self, d_in: int, d_out: int, d_emb: int = 64,
+                 n_freq: int = 128, *, key: jax.Array):
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        self.d_in = d_in
+        self.d_out = d_out
+
+        # log-spaced frequencies: w_i = -log(10^4) * i / n_freq
+        self.freqs = -math.log(1e4) * jnp.arange(n_freq) / n_freq
+
+        # sinusoidal input dim: t + sin(w*t) + cos(w*t) = 1 + 2*n_freq
+        sin_dim = 1 + 2 * n_freq
+
+        # 2-layer MLP with SiLU
+        self.mlp_0 = eqx.nn.Linear(sin_dim, d_emb, key=k1)
+        self.mlp_1 = eqx.nn.Linear(d_emb, d_emb, key=k2)
+
+        # project to flattened weight matrix
+        self.proj = eqx.nn.Linear(d_emb, d_out * d_in, key=k3)
+
+    def __call__(self, t: float) -> jax.Array:
+        """Map scalar t -> weight matrix [d_out, d_in]."""
+        # sinusoidal embedding
+        wt = self.freqs * t  # [n_freq]
+        emb = jnp.concatenate([jnp.array([t]), jnp.sin(wt), jnp.cos(wt)])
+
+        # MLP with SiLU activation
+        h = self.mlp_0(emb)
+        h = jax.nn.silu(h)
+        h = self.mlp_1(h)
+        h = jax.nn.silu(h)
+
+        # project and reshape to weight matrix
+        w = self.proj(h)
+        return w.reshape(self.d_out, self.d_in)
+
+
+# ---------------------------------------------------------------------------
+# SlotODE dynamics function (non-autonomous, time-dependent weights)
 # ---------------------------------------------------------------------------
 
 class SlotODEFunc(eqx.Module):
-    """The ODE vector field: ds/dt = f(t, s, k, v).
+    """Non-autonomous ODE vector field: ds/dt = f(t, s, k, v).
 
-    Computes velocity by asking "where would one discrete Slot Attention
-    iteration send these slots?" and pointing toward that target:
+    Uses time-dependent weights (DiffEqFormer-style hypernetworks) to make
+    the dynamics non-autonomous. This prevents slot clustering by allowing
+    weak attention early in integration and strong attention late, giving
+    slots time to differentiate before competing.
 
-        target = GRU(attended, slots) + MLP(LayerNorm(gru_output))
-        velocity = target - slots
-
-    The GRU provides gated selective updates (matching the baseline's
-    inductive bias), while Tsit5 handles smooth temporal integration.
     K, V are precomputed outside and passed as `args`.
     """
-    to_q: eqx.nn.Linear       # [slot_dim -> slot_dim]
+    # time-dependent weight generators (each has own MLP+Proj head)
+    time_dep_q: TimeDepWeight      # generates Q projection [slot_dim, slot_dim]
+    time_dep_mlp0: TimeDepWeight   # generates MLP layer 0  [slot_dim, mlp_hidden]
+    time_dep_mlp1: TimeDepWeight   # generates MLP layer 1  [mlp_hidden, slot_dim]
+
     norm_slots: eqx.nn.LayerNorm
+    norm_pre_ff: eqx.nn.LayerNorm
     scale: float
 
-    # GRU for gated mixing of attended info with current slots
-    gru: eqx.nn.GRUCell
+    slot_dim: int = eqx.field(static=True)
+    mlp_hidden: int = eqx.field(static=True)
 
-    # residual MLP (applied after GRU, matching baseline structure)
-    norm_pre_ff: eqx.nn.LayerNorm
-    mlp_0: eqx.nn.Linear      # [slot_dim -> mlp_hidden]
-    mlp_1: eqx.nn.Linear      # [mlp_hidden -> slot_dim]
-
-    def __init__(self, slot_dim: int, mlp_hidden: int = 128, *, key: jax.Array):
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+    def __init__(self, slot_dim: int, mlp_hidden: int = 128,
+                 d_emb: int = 64, *, key: jax.Array):
+        k1, k2, k3 = jax.random.split(key, 3)
         self.scale = slot_dim ** -0.5
+        self.slot_dim = slot_dim
+        self.mlp_hidden = mlp_hidden
 
-        self.to_q = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k1)
+        # time-dependent weight generators
+        self.time_dep_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, key=k1)
+        self.time_dep_mlp0 = TimeDepWeight(slot_dim, mlp_hidden, d_emb=d_emb, key=k2)
+        self.time_dep_mlp1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, key=k3)
+
+        # layer norms remain static
         self.norm_slots = eqx.nn.LayerNorm(slot_dim)
-
-        # GRU: input=attended (slot_dim), hidden=slots (slot_dim)
-        self.gru = eqx.nn.GRUCell(slot_dim, slot_dim, key=k2)
-
-        # residual MLP after GRU
         self.norm_pre_ff = eqx.nn.LayerNorm(slot_dim)
-        self.mlp_0 = eqx.nn.Linear(slot_dim, mlp_hidden, key=k3)
-        self.mlp_1 = eqx.nn.Linear(mlp_hidden, slot_dim, key=k4)
 
     def __call__(self, t: float, slots: jax.Array, args: tuple) -> jax.Array:
         """
@@ -100,9 +167,14 @@ class SlotODEFunc(eqx.Module):
         """
         k, v = args
 
-        # normalize slots then compute Q
+        # generate time-dependent weights
+        W_q = self.time_dep_q(t)        # [slot_dim, slot_dim]
+        W_mlp0 = self.time_dep_mlp0(t)  # [mlp_hidden, slot_dim]
+        W_mlp1 = self.time_dep_mlp1(t)  # [slot_dim, mlp_hidden]
+
+        # normalize slots then compute Q with time-dependent projection
         slots_norm = jax.vmap(jax.vmap(self.norm_slots))(slots)  # [B, N_slots, D]
-        q = jax.vmap(jax.vmap(self.to_q))(slots_norm)            # [B, N_slots, D]
+        q = jnp.einsum('bnd,od->bno', slots_norm, W_q)           # [B, N_slots, D]
 
         # scaled dot-product attention
         att_logits = jnp.einsum('bnd,bmd->bnm', q, k) * self.scale  # [B, N_slots, N_feat]
@@ -112,20 +184,14 @@ class SlotODEFunc(eqx.Module):
         # aggregate values
         attended = jnp.einsum('bnm,bmd->bnd', att, v)  # [B, N_slots, D]
 
-        # GRU gated update: selectively mix attended info into slots
-        gru_out = jax.vmap(jax.vmap(self.gru))(attended, slots)  # [B, N_slots, D]
-
-        # residual MLP refinement
-        gru_normed = jax.vmap(jax.vmap(self.norm_pre_ff))(gru_out)
-        h = jax.vmap(jax.vmap(self.mlp_0))(gru_normed)
+        # compute velocity via time-dependent MLP
+        diff = attended - slots  # what attention wants to change
+        diff_norm = jax.vmap(jax.vmap(self.norm_pre_ff))(diff)  # [B, N_slots, D]
+        h = jnp.einsum('bnd,od->bno', diff_norm, W_mlp0)       # [B, N_slots, mlp_hidden]
         h = jax.nn.relu(h)
-        h = jax.vmap(jax.vmap(self.mlp_1))(h)
-        target = gru_out + h  # [B, N_slots, D]
+        h = jnp.einsum('bnd,od->bno', h, W_mlp1)               # [B, N_slots, D]
 
-        # velocity points from current slots toward discrete-step target
-        velocity = target - slots
-
-        return velocity
+        return h
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +225,7 @@ class SlotAttentionODE(eqx.Module):
     to_k: eqx.nn.Linear
     to_v: eqx.nn.Linear
 
-    # ODE dynamics (Q projection + GRU + residual MLP)
+    # ODE dynamics (time-dependent weights, no GRU)
     slot_ode_func: SlotODEFunc
 
     def __init__(self, num_slots: int, slot_dim: int, enc_dim: int,

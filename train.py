@@ -377,7 +377,7 @@ def train(args):
 
     optimizer = optax.chain(
         optax.clip_by_global_norm(args.grad_clip),
-        optax.adam(schedule),
+        optax.adam(schedule, b2=0.95),
     )
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
