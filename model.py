@@ -213,8 +213,8 @@ class SlotAttentionODE(eqx.Module):
     solver_name: str = eqx.field(static=True)  # not a trainable param
     dt0: float = eqx.field(static=True)        # not a trainable param
 
-    # learnable slot initialization parameters
-    slots_mu: jax.Array         # [1, 1, slot_dim]
+    # learnable per-slot initialization parameters
+    slots_mu: jax.Array         # [1, num_slots, slot_dim]
     slots_log_sigma: jax.Array  # [1, 1, slot_dim]
 
     # input projection (matching original SA: LayerNorm -> Linear)
@@ -241,8 +241,8 @@ class SlotAttentionODE(eqx.Module):
         # step sizes: Euler needs larger steps (1.0), higher-order solvers use 0.25
         self.dt0 = 1.0 if solver == "euler" else 0.25
 
-        # learnable init — these are plain arrays, not Modules
-        self.slots_mu = jax.random.normal(k1, (1, 1, slot_dim))
+        # learnable per-slot init — each slot gets a distinct learned mean
+        self.slots_mu = jax.random.normal(k1, (1, num_slots, slot_dim)) * 0.1
         self.slots_log_sigma = jnp.zeros((1, 1, slot_dim))
 
         # input projection
