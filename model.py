@@ -111,91 +111,178 @@ class TimeDepWeight(eqx.Module):
 # SlotODE dynamics function (non-autonomous, time-dependent weights)
 # ---------------------------------------------------------------------------
 
+# class SlotODEFunc(eqx.Module):
+#     """Non-autonomous ODE vector field: ds/dt = gate * f(s, features, t) + g(s, t).
+
+#     DiffEqFormer-style formulation (Tong et al. 2025, Eq. 2) adapted for
+#     Slot Attention, with per-dimension gating on the attention signal.
+
+#     The gate sees both the current slot state and the proposed attention update,
+#     and learns to modulate each dimension of the attention velocity independently.
+#     This provides the selective per-dimension integration that the GRU gives
+#     baseline slot attention, while remaining compatible with ODE integration.
+
+#         f = cross-attention (slots query features, softmax over slots)
+#         gate = sigmoid(W_gate(t) @ [slots_norm; f_attn])
+#         g = feedforward MLP refinement
+
+#     velocity = gate * f_attn + g_ff
+#     """
+#     # time-dependent weight generators
+#     tdw_q: TimeDepWeight       # generates Q projection    [slot_dim, slot_dim]
+#     tdw_gate: TimeDepWeight    # generates gate projection [slot_dim, 2*slot_dim]
+#     tdw_ff0: TimeDepWeight     # generates FF layer 0      [mlp_hidden, slot_dim]
+#     tdw_ff1: TimeDepWeight     # generates FF layer 1      [slot_dim, mlp_hidden]
+
+#     norm_attn: eqx.nn.LayerNorm
+#     norm_ff: eqx.nn.LayerNorm
+#     scale: float
+
+#     slot_dim: int = eqx.field(static=True)
+#     mlp_hidden: int = eqx.field(static=True)
+
+#     def __init__(self, slot_dim: int, mlp_hidden: int = 128,
+#                  d_emb: int = 64, *, key: jax.Array):
+#         k1, k2, k3, k4 = jax.random.split(key, 4)
+#         self.scale = slot_dim ** -0.5
+#         self.slot_dim = slot_dim
+#         self.mlp_hidden = mlp_hidden
+
+#         self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, key=k1)
+#         self.tdw_gate = TimeDepWeight(2 * slot_dim, slot_dim, d_emb=d_emb, key=k2)
+#         self.tdw_ff0 = TimeDepWeight(slot_dim, mlp_hidden, d_emb=d_emb, key=k3)
+#         self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, key=k4)
+
+#         self.norm_attn = eqx.nn.LayerNorm(slot_dim)
+#         self.norm_ff = eqx.nn.LayerNorm(slot_dim)
+
+#     def __call__(self, t: float, slots: jax.Array, args: tuple) -> jax.Array:
+#         """
+#         slots:  [B, N_slots, D]
+#         args:   (k, v) — static precomputed keys and values
+#           k: [B, N_feat, D]
+#           v: [B, N_feat, D]
+
+#         returns: velocity [B, N_slots, D]
+#         """
+#         k, v = args
+
+#         # time-dependent weights
+#         W_q = self.tdw_q(t)        # [D, D]
+#         W_gate = self.tdw_gate(t)  # [D, 2*D]
+#         W_ff0 = self.tdw_ff0(t)    # [mlp_hidden, D]
+#         W_ff1 = self.tdw_ff1(t)    # [D, mlp_hidden]
+
+#         # --- f: cross-attention ---
+#         slots_norm = jax.vmap(jax.vmap(self.norm_attn))(slots)
+#         q = jnp.einsum('bnd,od->bno', slots_norm, W_q)
+
+#         att_logits = jnp.einsum('bnd,bmd->bnm', q, k) * self.scale
+#         att = jax.nn.softmax(att_logits, axis=1)
+#         att = att / (att.sum(axis=-1, keepdims=True) + 1e-8)
+#         f_attn = jnp.einsum('bnm,bmd->bnd', att, v)
+
+#         # --- gate: per-dimension modulation of attention signal ---
+#         gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1)  # [B, N, 2*D]
+#         gate = jax.nn.sigmoid(
+#             jnp.einsum('bnd,od->bno', gate_input, W_gate)
+#         )  # [B, N, D]
+
+#         # --- g: feedforward ---
+#         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
+#         h = jnp.einsum('bnd,od->bno', slots_ff, W_ff0)
+#         h = jax.nn.relu(h)
+#         h = jnp.einsum('bnd,od->bno', h, W_ff1)
+#         g_ff = h
+
+#         # velocity = gated attention + feedforward
+#         return gate * f_attn + g_ff
+    
 class SlotODEFunc(eqx.Module):
-    """Non-autonomous ODE vector field: ds/dt = gate * f(s, features, t) + g(s, t).
-
-    DiffEqFormer-style formulation (Tong et al. 2025, Eq. 2) adapted for
-    Slot Attention, with per-dimension gating on the attention signal.
-
-    The gate sees both the current slot state and the proposed attention update,
-    and learns to modulate each dimension of the attention velocity independently.
-    This provides the selective per-dimension integration that the GRU gives
-    baseline slot attention, while remaining compatible with ODE integration.
-
-        f = cross-attention (slots query features, softmax over slots)
-        gate = sigmoid(W_gate(t) @ [slots_norm; f_attn])
-        g = feedforward MLP refinement
-
-    velocity = gate * f_attn + g_ff
+    """Non-autonomous ODE vector field: ds/dt = gate * f(s, features, t) + g(s, f_attn, t).
+ 
+    Two changes from baseline SlotODEFunc:
+ 
+    1. Per-dimension gate on the attention signal (Option 2):
+       gate = sigmoid(W_gate(t) @ [slots_norm; f_attn])
+       Allows selective per-dimension acceptance of attention updates.
+ 
+    2. Informed feedforward (Option 1):
+       The feedforward MLP receives both the slot state AND the attention
+       output, so it can learn corrections based on what attention proposed.
+       e.g. "attention pulled toward two objects, push back toward one"
+ 
+    velocity = gate * f_attn + g_ff(slots, f_attn)
     """
     # time-dependent weight generators
     tdw_q: TimeDepWeight       # generates Q projection    [slot_dim, slot_dim]
     tdw_gate: TimeDepWeight    # generates gate projection [slot_dim, 2*slot_dim]
-    tdw_ff0: TimeDepWeight     # generates FF layer 0      [mlp_hidden, slot_dim]
+    tdw_ff0: TimeDepWeight     # generates FF layer 0      [mlp_hidden, 2*slot_dim]  <- changed
     tdw_ff1: TimeDepWeight     # generates FF layer 1      [slot_dim, mlp_hidden]
-
+ 
     norm_attn: eqx.nn.LayerNorm
     norm_ff: eqx.nn.LayerNorm
     scale: float
-
+ 
     slot_dim: int = eqx.field(static=True)
     mlp_hidden: int = eqx.field(static=True)
-
+ 
     def __init__(self, slot_dim: int, mlp_hidden: int = 128,
                  d_emb: int = 64, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
         self.scale = slot_dim ** -0.5
         self.slot_dim = slot_dim
         self.mlp_hidden = mlp_hidden
-
+ 
         self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, key=k1)
         self.tdw_gate = TimeDepWeight(2 * slot_dim, slot_dim, d_emb=d_emb, key=k2)
-        self.tdw_ff0 = TimeDepWeight(slot_dim, mlp_hidden, d_emb=d_emb, key=k3)
+        self.tdw_ff0 = TimeDepWeight(2 * slot_dim, mlp_hidden, d_emb=d_emb, key=k3)  # 2*D input
         self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, key=k4)
-
+ 
         self.norm_attn = eqx.nn.LayerNorm(slot_dim)
         self.norm_ff = eqx.nn.LayerNorm(slot_dim)
-
+ 
     def __call__(self, t: float, slots: jax.Array, args: tuple) -> jax.Array:
         """
         slots:  [B, N_slots, D]
         args:   (k, v) — static precomputed keys and values
           k: [B, N_feat, D]
           v: [B, N_feat, D]
-
+ 
         returns: velocity [B, N_slots, D]
         """
         k, v = args
-
+ 
         # time-dependent weights
         W_q = self.tdw_q(t)        # [D, D]
         W_gate = self.tdw_gate(t)  # [D, 2*D]
-        W_ff0 = self.tdw_ff0(t)    # [mlp_hidden, D]
+        W_ff0 = self.tdw_ff0(t)    # [mlp_hidden, 2*D]
         W_ff1 = self.tdw_ff1(t)    # [D, mlp_hidden]
-
+ 
         # --- f: cross-attention ---
         slots_norm = jax.vmap(jax.vmap(self.norm_attn))(slots)
         q = jnp.einsum('bnd,od->bno', slots_norm, W_q)
-
+ 
         att_logits = jnp.einsum('bnd,bmd->bnm', q, k) * self.scale
         att = jax.nn.softmax(att_logits, axis=1)
         att = att / (att.sum(axis=-1, keepdims=True) + 1e-8)
         f_attn = jnp.einsum('bnm,bmd->bnd', att, v)
-
+ 
         # --- gate: per-dimension modulation of attention signal ---
         gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1)  # [B, N, 2*D]
         gate = jax.nn.sigmoid(
             jnp.einsum('bnd,od->bno', gate_input, W_gate)
         )  # [B, N, D]
-
-        # --- g: feedforward ---
+ 
+        # --- g: informed feedforward (sees both slot state and attention output) ---
         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
-        h = jnp.einsum('bnd,od->bno', slots_ff, W_ff0)
+        ff_input = jnp.concatenate([slots_ff, f_attn], axis=-1)      # [B, N, 2*D]
+        h = jnp.einsum('bnd,od->bno', ff_input, W_ff0)               # [B, N, mlp_hidden]
         h = jax.nn.relu(h)
-        h = jnp.einsum('bnd,od->bno', h, W_ff1)
+        h = jnp.einsum('bnd,od->bno', h, W_ff1)                      # [B, N, D]
         g_ff = h
-
-        # velocity = gated attention + feedforward
+ 
+        # velocity = gated attention + informed feedforward
         return gate * f_attn + g_ff
 
 # ---------------------------------------------------------------------------
