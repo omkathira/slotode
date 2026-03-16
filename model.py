@@ -228,16 +228,16 @@ class SlotODEFunc(eqx.Module):
     mlp_hidden: int = eqx.field(static=True)
  
     def __init__(self, slot_dim: int, mlp_hidden: int = 128,
-                 d_emb: int = 64, *, key: jax.Array):
+                 d_emb: int = 64, n_freq: int = 128, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
         self.scale = slot_dim ** -0.5
         self.slot_dim = slot_dim
         self.mlp_hidden = mlp_hidden
- 
-        self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, key=k1)
-        self.tdw_gate = TimeDepWeight(2 * slot_dim, slot_dim, d_emb=d_emb, key=k2)
-        self.tdw_ff0 = TimeDepWeight(2 * slot_dim, mlp_hidden, d_emb=d_emb, key=k3)  # 2*D input
-        self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, key=k4)
+
+        self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k1)
+        self.tdw_gate = TimeDepWeight(2 * slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k2)
+        self.tdw_ff0 = TimeDepWeight(2 * slot_dim, mlp_hidden, d_emb=d_emb, n_freq=n_freq, key=k3)  # 2*D input
+        self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k4)
  
         self.norm_attn = eqx.nn.LayerNorm(slot_dim)
         self.norm_ff = eqx.nn.LayerNorm(slot_dim)
@@ -320,7 +320,8 @@ class SlotAttentionODE(eqx.Module):
     slot_ode_func: SlotODEFunc
 
     def __init__(self, num_slots: int, slot_dim: int, enc_dim: int,
-                 num_iter: int = 3, solver: str = "tsit5", *,
+                 num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
+                 d_emb: int = 64, n_freq: int = 128, *,
                  key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
@@ -328,9 +329,7 @@ class SlotAttentionODE(eqx.Module):
         self.slot_dim = slot_dim
         self.T = float(num_iter)
         self.solver_name = solver
-
-        # step sizes: Euler needs larger steps (1.0), higher-order solvers use 0.25
-        self.dt0 = 1.0 if solver == "euler" else 0.25
+        self.dt0 = dt0
 
         # learnable per-slot init — each slot gets a distinct learned mean
         self.slots_mu = jax.random.normal(k1, (1, num_slots, slot_dim)) * 0.1
@@ -345,7 +344,7 @@ class SlotAttentionODE(eqx.Module):
         self.to_v = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k4)
 
         # ODE dynamics
-        self.slot_ode_func = SlotODEFunc(slot_dim, key=key)
+        self.slot_ode_func = SlotODEFunc(slot_dim, d_emb=d_emb, n_freq=n_freq, key=key)
 
     def initialize_slots(self, batch_size: int, key: jax.Array) -> jax.Array:
         """Sample initial slots from learned Gaussian. [B, N_slots, D]"""
@@ -385,12 +384,6 @@ class SlotAttentionODE(eqx.Module):
         if self.solver_name == "euler":
             solver = diffrax.Euler()
             stepsize_controller = diffrax.ConstantStepSize()
-        elif self.solver_name == "tsit5":
-            solver = diffrax.Tsit5()
-            stepsize_controller = diffrax.ConstantStepSize()
-        elif self.solver_name == "dopri5":
-            solver = diffrax.Dopri5()
-            stepsize_controller = diffrax.PIDController(atol=1e-5, rtol=1e-5)
         else:
             raise ValueError(f"Unknown solver: {self.solver_name}")
 
@@ -564,7 +557,8 @@ class SlotODEModel(eqx.Module):
 
     def __init__(self, resolution: tuple = (64, 64), num_slots: int = 7,
                  slot_dim: int = 64, enc_hidden_dim: int = 64,
-                 num_iter: int = 3, solver: str = "tsit5", *, key: jax.Array):
+                 num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
+                 d_emb: int = 64, n_freq: int = 128, *, key: jax.Array):
         (k_c0, k_c1, k_c2, k_c3, k_pos, k_f0, k_f1,
          k_sa, k_dec) = jax.random.split(key, 9)
 
@@ -587,7 +581,8 @@ class SlotODEModel(eqx.Module):
         # slot attention ODE
         self.slot_attention_ode = SlotAttentionODE(
             num_slots=num_slots, slot_dim=slot_dim, enc_dim=enc_hidden_dim,
-            num_iter=num_iter, solver=solver, key=k_sa
+            num_iter=num_iter, solver=solver, dt0=dt0,
+            d_emb=d_emb, n_freq=n_freq, key=k_sa
         )
 
         # decoder

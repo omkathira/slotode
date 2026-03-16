@@ -260,6 +260,8 @@ def evaluate(args):
             enc_hidden_dim=ckpt_args['enc_hidden_dim'],
             num_iter=ckpt_args['num_iter'],
             solver=ckpt_args.get('solver', 'tsit5'),
+            d_emb=ckpt_args.get('d_emb', 64),
+            n_freq=ckpt_args.get('n_freq', 128),
             key=key,
         )
     else:

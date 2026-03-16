@@ -299,7 +299,7 @@ def load_checkpoint(path: str, model, optimizer):
 def parse_args():
     p = argparse.ArgumentParser(description="Train Slot Attention models on CLEVR-with-masks (JAX)")
     p.add_argument("--model",          default="slot_ode", choices=["slot_ode", "baseline"])
-    p.add_argument("--solver",         default="tsit5", choices=["euler", "tsit5", "dopri5"],
+    p.add_argument("--solver",         default="euler", choices=["euler"],
                    help="ODE solver for slot_ode model (ignored for baseline)")
     p.add_argument("--data_dir",       default="CLEVR_64",
                    help="Path to pre-converted dataset (from convert_tfrecords.py)")
@@ -315,6 +315,12 @@ def parse_args():
     p.add_argument("--slot_dim",       type=int,   default=64)
     p.add_argument("--enc_hidden_dim", type=int,   default=64)
     p.add_argument("--num_iter",       type=int,   default=3)
+    p.add_argument("--dt",             type=float, default=None,
+                   help="ODE integration step size (default: 1.0)")
+    p.add_argument("--d_emb",          type=int,   default=64,
+                   help="Hypernet MLP embedding dim")
+    p.add_argument("--n_freq",         type=int,   default=128,
+                   help="Number of sinusoidal frequencies in hypernet")
     p.add_argument("--log_every",      type=int,   default=100)
     p.add_argument("--val_every",      type=int,   default=5_000)
     p.add_argument("--img_every",      type=int,   default=5_000)
@@ -349,10 +355,12 @@ def train(args):
 
     # ---- model ------------------------------------------------------------
     if args.model == "slot_ode":
+        dt0 = args.dt if args.dt is not None else 1.0
         model = SlotODEModel(
             resolution=(res, res), num_slots=args.num_slots,
             slot_dim=args.slot_dim, enc_hidden_dim=args.enc_hidden_dim,
-            num_iter=args.num_iter, solver=args.solver, key=model_key
+            num_iter=args.num_iter, solver=args.solver, dt0=dt0,
+            d_emb=args.d_emb, n_freq=args.n_freq, key=model_key
         )
     else:
         model = SlotAttentionModel(
