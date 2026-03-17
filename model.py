@@ -126,7 +126,7 @@ class SlotODEFunc(eqx.Module):
  
         # --- gate: per-dimension modulation of attention signal ---
         gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1) # [B, N_slots, 2 * slot_dim]
-        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, W_gate)) # [B, N, D]
+        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, W_gate)) # [B, N, slot_dim]
  
         # --- g: informed feedforward (sees both slot state and attention output) ---
         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
