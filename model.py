@@ -220,9 +220,7 @@ class SlotODEFunc(eqx.Module):
  
         # --- gate: per-dimension modulation of attention signal ---
         gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1) # [B, N_slots, 2 * slot_dim]
-        gate = jax.nn.sigmoid(
-            jnp.einsum('bnd,od->bno', gate_input, W_gate)
-        )  # [B, N, D]
+        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, W_gate)) # [B, N, D]
  
         # --- g: informed feedforward (sees both slot state and attention output) ---
         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
@@ -255,10 +253,11 @@ class SlotAttentionODE(eqx.Module):
     to_k: eqx.nn.Linear
     to_v: eqx.nn.Linear
 
-    # ODE dynamics (Q(t) and feedforward network)
+    # ODE/SDE dynamics (Q(t), feedforward network, and noise coefficient)
     slot_ode_func: SlotODEFunc
+    sigma: float
 
-    def __init__(self, num_slots: int, slot_dim: int, enc_dim: int, num_iter: int = 3, solver: str = "euler", dt0: float = 1.0, d_emb: int = 64, n_freq: int = 128, *, key: jax.Array):
+    def __init__(self, num_slots: int, slot_dim: int, enc_dim: int, num_iter: int = 3, solver: str = "euler", dt0: float = 1.0, sigma: float = 0.2, d_emb: int = 32, n_freq: int = 16, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.num_slots = num_slots
@@ -266,6 +265,7 @@ class SlotAttentionODE(eqx.Module):
         self.T = float(num_iter)
         self.solver_name = solver
         self.dt0 = dt0
+        self.sigma = sigma
 
         self.slots_mu = jax.random.normal(k1, (1, 1, slot_dim))
         self.slots_log_sigma = jnp.zeros((1, 1, slot_dim))
@@ -288,7 +288,7 @@ class SlotAttentionODE(eqx.Module):
     def __call__(self, enc_feat: jax.Array, key: jax.Array, return_traj: bool = False, num_traj_pts: int = 20) -> tuple:
         """
         enc_feat: [B, N_feat, D_encoder]
-        key: PRNG key for slot initialization
+        key: PRNG key for slot initializationd
         return_traj: if True, return trajectory at multiple time points
 
         returns:
@@ -314,12 +314,16 @@ class SlotAttentionODE(eqx.Module):
         # initialize slots
         slots_0 = self.initialize_slots(B, init_key)
 
-        # SDE
+        # setup ODE/SDE
         drift = diffrax.ODETerm(self.slot_ode_func)
-        brownian = diffrax.VirtualBrownianTree(t0=0.0, t1=self.T, tol=0.1, shape=slots_0.shape, key=noise_key)
-        diffusion_func = lambda t, y, args: self.sigma * (1.0 - t / self.T)
-        diffusion = diffrax.ControlTerm(diffusion_func, brownian)
-        term = diffrax.MultiTerm(drift, diffusion)
+
+        if self.sigma > 0:
+            brownian = diffrax.VirtualBrownianTree(t0=0.0, t1=self.T, tol=0.1, shape=slots_0.shape, key=noise_key)
+            diffusion_func = lambda t, y, args: self.sigma * (1.0 - t / self.T)
+            diffusion = diffrax.ControlTerm(diffusion_func, brownian)
+            term = diffrax.MultiTerm(drift, diffusion)
+        else:
+            term = drift
 
         if self.solver_name == "euler":
             solver = diffrax.Euler()
@@ -377,7 +381,7 @@ class SlotODEModel(eqx.Module):
     dec: SpatialBroadcastDecoder
 
     def __init__(self, resolution: tuple = (64, 64), num_slots: int = 7, slot_dim: int = 64, enc_hidden_dim: int = 64,
-                 num_iter: int = 3, solver: str = "euler", dt0: float = 1.0, d_emb: int = 64, n_freq: int = 128, *, key: jax.Array):
+                 num_iter: int = 3, solver: str = "euler", dt0: float = 1.0, sigma: float = 0.1, d_emb: int = 64, n_freq: int = 128, *, key: jax.Array):
         k_enc, k_sa, k_dec = jax.random.split(key, 3)
 
         self.resolution = resolution
@@ -387,7 +391,7 @@ class SlotODEModel(eqx.Module):
 
         self.slot_attention_ode = SlotAttentionODE(
             num_slots=num_slots, slot_dim=slot_dim, enc_dim=enc_hidden_dim,
-            num_iter=num_iter, solver=solver, dt0=dt0, d_emb=d_emb, n_freq=n_freq, key=k_sa
+            num_iter=num_iter, solver=solver, dt0=dt0, sigma=sigma, d_emb=d_emb, n_freq=n_freq, key=k_sa
         )
 
         self.dec = SpatialBroadcastDecoder(slot_dim, resolution, dec_hidden_dim=enc_hidden_dim, key=k_dec)
