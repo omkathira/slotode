@@ -319,8 +319,8 @@ class SlotAttentionODE(eqx.Module):
 
         if self.sigma > 0:
             brownian = diffrax.VirtualBrownianTree(t0=0.0, t1=self.T, tol=0.1, shape=slots_0.shape, key=noise_key)
-            diffusion_func = lambda t, y, args: self.sigma * (1.0 - t / self.T)
-            diffusion = diffrax.ControlTerm(diffusion_func, brownian)
+            diffusion_func = lambda t, y, args: jnp.full_like(y, self.sigma * (1.0 - t / self.T))
+            diffusion = diffrax.WeaklyDiagonalControlTerm(diffusion_func, brownian)
             term = diffrax.MultiTerm(drift, diffusion)
         else:
             term = drift
