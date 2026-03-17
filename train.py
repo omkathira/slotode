@@ -299,7 +299,7 @@ def load_checkpoint(path: str, model, optimizer):
 def parse_args():
     p = argparse.ArgumentParser(description="Train Slot Attention models on CLEVR-with-masks (JAX)")
     p.add_argument("--model",          default="slot_ode", choices=["slot_ode", "baseline"])
-    p.add_argument("--solver",         default="euler", choices=["euler"],
+    p.add_argument("--solver",         default="euler", choices=["euler", "dopri5"],
                    help="ODE solver for slot_ode model (ignored for baseline)")
     p.add_argument("--data_dir",       default="CLEVR_64",
                    help="Path to pre-converted dataset (from convert_tfrecords.py)")
