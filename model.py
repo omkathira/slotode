@@ -236,14 +236,6 @@ class SlotODEFunc(eqx.Module):
 
 # slot attention as a continuous-time neural dynamical system
 class SlotAttentionODE(eqx.Module):
-    """Initializes slots and integrates the ODE to evolve them.
-
-    Diffrax usage:
-      - ODETerm wraps our vector field (SlotODEFunc)
-      - We use Tsit5 with ConstantStepSize for training (stable, predictable)
-      - For analysis, swap to Dopri5 + PIDController for adaptive stepping
-      - SaveAt(ts=...) captures the full trajectory for visualization
-    """
     # hyperparameters
     num_slots: int
     slot_dim: int
@@ -281,7 +273,7 @@ class SlotAttentionODE(eqx.Module):
         self.norm_input = eqx.nn.LayerNorm(enc_dim)
         self.fc_input = eqx.nn.Linear(enc_dim, slot_dim, key=k2)
 
-        # static K and V projections (precomputed once per forward pass)
+        # fixed K and V projections (precomputed once per forward pass)
         self.to_k = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k3)
         self.to_v = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k4)
 
@@ -312,10 +304,22 @@ class SlotAttentionODE(eqx.Module):
         v = jax.vmap(jax.vmap(self.to_v))(feat) # [B, N_feat, D_slot]
 
         # initialize slots
-        slots_0 = self.initialize_slots(B, key) # [B, N_slots, D_slot]
+        # slots_0 = self.initialize_slots(B, key) # [B, N_slots, D_slot]
 
         # set up the ODE term with diffrax
-        term = diffrax.ODETerm(self.slot_ode_func)
+        # term = diffrax.ODETerm(self.slot_ode_func)
+
+        key, init_key, noise_key = jax.random.split(key, 3)
+
+        # initialize slots
+        slots_0 = self.initialize_slots(B, init_key)
+
+        # SDE
+        drift = diffrax.ODETerm(self.slot_ode_func)
+        brownian = diffrax.VirtualBrownianTree(t0=0.0, t1=self.T, tol=0.1, shape=slots_0.shape, key=noise_key)
+        diffusion_func = lambda t, y, args: self.sigma * (1.0 - t / self.T)
+        diffusion = diffrax.ControlTerm(diffusion_func, brownian)
+        term = diffrax.MultiTerm(drift, diffusion)
 
         if self.solver_name == "euler":
             solver = diffrax.Euler()

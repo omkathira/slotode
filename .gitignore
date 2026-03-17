@@ -4,6 +4,7 @@ __pycache__/
 checkpoints/
 mlflow.db
 mlruns/
+runs_data/
 .ipynb_checkpoints/
 *.pdf
 CLEVR_64/
