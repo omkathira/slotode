@@ -173,7 +173,9 @@ class SlotAttentionODE(eqx.Module):
         self.dt0 = dt0
 
         self.slots_mu = jax.random.normal(k1, (1, 1, slot_dim))
-        self.slots_log_sigma = jnp.zeros((1, 1, slot_dim))
+        # self.slots_log_sigma = jnp.zeros((1, 1, slot_dim))
+
+        self.slots_log_sigma = jnp.full((1, 1, slot_dim), math.log(2.0))
 
         self.norm_input = eqx.nn.LayerNorm(enc_dim)
         self.fc_input = eqx.nn.Linear(enc_dim, slot_dim, key=k2)
