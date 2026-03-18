@@ -165,7 +165,6 @@ class SlotAttentionODE(eqx.Module):
     num_slots: int
     slot_dim: int
     T: float # integration time
-    solver_name: str = eqx.field(static=True)
     dt0: float = eqx.field(static=True)
 
     # learnable slot initialization
