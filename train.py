@@ -69,6 +69,7 @@ import mlflow
 
 from model import SlotODEModel
 from model_baseline import SlotAttentionModel
+from evaluate import compute_ari_fg
 
 
 # ---------------------------------------------------------------------------
@@ -165,22 +166,33 @@ def train_step(model, opt_state, optimizer, images, key):
 
 @eqx.filter_jit
 def eval_step(model, images, key):
-    """Compute MSE loss for a single batch (no gradients)."""
+    """Compute MSE loss + predicted masks for a single batch."""
     recon, masks, slots = model(images, key=key)
-    return mse_loss(recon, images)
+    return mse_loss(recon, images), masks
 
 
-def eval_loss(model, val_ds, key, max_batches=50):
-    """Average validation loss over up to max_batches."""
-    total, count = 0.0, 0
-    for imgs, _, _ in val_ds:
+def eval_metrics(model, val_ds, key, max_batches=50):
+    """Average validation loss and ARI-FG over up to max_batches."""
+    total_loss, total_ari, n_imgs = 0.0, 0.0, 0
+    count = 0
+    for imgs, gt_masks, _ in val_ds:
         if count >= max_batches:
             break
         key, subkey = jax.random.split(key)
-        loss = eval_step(model, jnp.array(imgs), subkey)
-        total += float(loss)
+        loss, pred_masks = eval_step(model, jnp.array(imgs), subkey)
+        total_loss += float(loss)
         count += 1
-    return total / max(1, count)
+
+        pred_masks_np = np.array(pred_masks)
+        for i in range(pred_masks_np.shape[0]):
+            pred_seg = pred_masks_np[i].argmax(axis=0)
+            gt_seg = gt_masks[i].argmax(axis=0) if gt_masks[i].ndim == 3 else gt_masks[i]
+            total_ari += compute_ari_fg(pred_seg, gt_seg)
+            n_imgs += 1
+
+    avg_loss = total_loss / max(1, count)
+    avg_ari = total_ari / max(1, n_imgs)
+    return avg_loss, avg_ari
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +311,6 @@ def load_checkpoint(path: str, model, optimizer):
 def parse_args():
     p = argparse.ArgumentParser(description="Train Slot Attention models on CLEVR-with-masks (JAX)")
     p.add_argument("--model",          default="slot_ode", choices=["slot_ode", "baseline"])
-    p.add_argument("--solver",         default="euler", choices=["euler", "dopri5"],
-                   help="ODE solver for slot_ode model (ignored for baseline)")
     p.add_argument("--data_dir",       default="CLEVR_64",
                    help="Path to pre-converted dataset (from convert_tfrecords.py)")
     p.add_argument("--resolution",     type=int,   default=64,
@@ -323,12 +333,6 @@ def parse_args():
                    help="Number of sinusoidal frequencies in hypernet")
     p.add_argument("--autonomous",     action="store_true",
                    help="Use autonomous ODE (fixed weights, no hypernetwork)")
-    p.add_argument("--rtol",           type=float, default=1e-3,
-                   help="Relative tolerance for adaptive solvers (Dopri5)")
-    p.add_argument("--atol",           type=float, default=1e-6,
-                   help="Absolute tolerance for adaptive solvers (Dopri5)")
-    p.add_argument("--max_steps",      type=int,   default=256,
-                   help="Max ODE solver steps per forward pass")
     p.add_argument("--log_every",      type=int,   default=100)
     p.add_argument("--val_every",      type=int,   default=5_000)
     p.add_argument("--img_every",      type=int,   default=5_000)
@@ -367,10 +371,9 @@ def train(args):
         model = SlotODEModel(
             resolution=(res, res), num_slots=args.num_slots,
             slot_dim=args.slot_dim, enc_hidden_dim=args.enc_hidden_dim,
-            num_iter=args.num_iter, solver=args.solver, dt0=dt0,
+            num_iter=args.num_iter, dt0=dt0,
             d_emb=args.d_emb, n_freq=args.n_freq,
             autonomous=args.autonomous,
-            rtol=args.rtol, atol=args.atol, max_steps=args.max_steps,
             key=model_key
         )
     else:
@@ -455,9 +458,12 @@ def train(args):
                 # ---- validation -------------------------------------------
                 if global_step % args.val_every == 0:
                     key, val_key = jax.random.split(key)
-                    val_loss_val = eval_loss(model, val_ds, val_key, max_batches=50)
-                    mlflow.log_metric("val/loss", val_loss_val, step=global_step)
-                    print(f"[step {global_step:>7d}]  val_loss={val_loss_val:.5f}"
+                    val_loss_val, val_ari = eval_metrics(model, val_ds, val_key, max_batches=50)
+                    mlflow.log_metrics(
+                        {"val/loss": val_loss_val, "val/ari_fg": val_ari},
+                        step=global_step,
+                    )
+                    print(f"[step {global_step:>7d}]  val_loss={val_loss_val:.5f}  ARI-FG={val_ari:.4f}"
                           f"  best={best_val_loss:.5f}")
                     if val_loss_val < best_val_loss:
                         best_val_loss = val_loss_val

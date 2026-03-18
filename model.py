@@ -107,14 +107,10 @@ class SlotODEFunc(eqx.Module):
 
         if autonomous:
             self.tdw_q = self.tdw_gate = self.tdw_ff0 = self.tdw_ff1 = None
-            scale_q = (slot_dim ** -0.5)
-            scale_gate = ((2 * slot_dim) ** -0.5)
-            scale_ff0 = ((2 * slot_dim) ** -0.5)
-            scale_ff1 = (mlp_hidden ** -0.5)
-            self.W_q = jax.random.normal(k1, (slot_dim, slot_dim)) * scale_q
-            self.W_gate = jax.random.normal(k2, (slot_dim, 2 * slot_dim)) * scale_gate
-            self.W_ff0 = jax.random.normal(k3, (mlp_hidden, 2 * slot_dim)) * scale_ff0
-            self.W_ff1 = jax.random.normal(k4, (slot_dim, mlp_hidden)) * scale_ff1
+            self.W_q = jax.random.normal(k1, (slot_dim, slot_dim)) * (slot_dim ** -0.5)
+            self.W_gate = jax.random.normal(k2, (slot_dim, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
+            self.W_ff0 = jax.random.normal(k3, (mlp_hidden, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
+            self.W_ff1 = jax.random.normal(k4, (slot_dim, mlp_hidden)) * (mlp_hidden ** -0.5)
         else:
             self.W_q = self.W_gate = self.W_ff0 = self.W_ff1 = None
             self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k1)
@@ -171,9 +167,6 @@ class SlotAttentionODE(eqx.Module):
     T: float # integration time
     solver_name: str = eqx.field(static=True)
     dt0: float = eqx.field(static=True)
-    rtol: float = eqx.field(static=True)
-    atol: float = eqx.field(static=True)
-    max_steps: int = eqx.field(static=True)
 
     # learnable slot initialization
     slots_mu: jax.Array # [1, num_slots, slot_dim]
@@ -190,22 +183,16 @@ class SlotAttentionODE(eqx.Module):
     # ODE/SDE dynamics (Q(t), feedforward network, and noise coefficient)
     slot_ode_func: SlotODEFunc
 
-    def __init__(self, num_slots: int, slot_dim: int, enc_dim: int, num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False,
-                 rtol: float = 1e-3, atol: float = 1e-6, max_steps: int = 256, *, key: jax.Array):
+    def __init__(self, num_slots: int, slot_dim: int, enc_dim: int, num_iter: int = 3, dt0: float = 1.0,
+                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.T = float(num_iter)
-        self.solver_name = solver
         self.dt0 = dt0
-        self.rtol = rtol
-        self.atol = atol
-        self.max_steps = max_steps
 
         self.slots_mu = jax.random.normal(k1, (1, 1, slot_dim))
-
         self.slots_log_sigma = jnp.full((1, 1, slot_dim), math.log(2.0))
 
         self.norm_input = eqx.nn.LayerNorm(enc_dim)
@@ -216,22 +203,14 @@ class SlotAttentionODE(eqx.Module):
 
         self.slot_ode_func = SlotODEFunc(slot_dim, d_emb=d_emb, n_freq=n_freq, autonomous=autonomous, key=key)
 
-    def initialize_slots(self, batch_size: int, key: jax.Array) -> jax.Array: # sample initial slots from a learned gaussian
-        mu = jnp.broadcast_to(self.slots_mu, (batch_size, self.num_slots, self.slot_dim)) # [B, N_slots, slot_dim]
-        sigma = jnp.broadcast_to(jnp.exp(self.slots_log_sigma), (batch_size, self.num_slots, self.slot_dim)) # [B, N_slots, slot_dim]
+    def initialize_slots(self, batch_size: int, key: jax.Array) -> jax.Array:
+        mu = jnp.broadcast_to(self.slots_mu, (batch_size, self.num_slots, self.slot_dim))
+        sigma = jnp.broadcast_to(jnp.exp(self.slots_log_sigma), (batch_size, self.num_slots, self.slot_dim))
         noise = jax.random.normal(key, mu.shape)
         return mu + sigma * noise # [B, N_slots, slot_dim]
 
-    def __call__(self, enc_feat: jax.Array, key: jax.Array, return_traj: bool = False, num_traj_pts: int = 20) -> tuple:
-        """
-        enc_feat: [B, N_feat, D_encoder]
-        key: PRNG key for slot initialization
-        return_traj: if True, return trajectory at multiple time points
-
-        returns:
-            slots: [B, N_slots, D_slot]
-            (optional) traj: [num_traj_pts, B, N_slots, D_slot]
-        """
+    def __call__(self, enc_feat: jax.Array, key: jax.Array, return_traj: bool = False,
+                 num_traj_pts: int = 20) -> tuple:
         B = enc_feat.shape[0]
 
         # project input features and precompute K and V
@@ -245,20 +224,15 @@ class SlotAttentionODE(eqx.Module):
 
         # set up the ODE term with diffrax
         term = diffrax.ODETerm(self.slot_ode_func)
-
-        if self.solver_name == "euler":
-            solver = diffrax.Euler()
-            stepsize_controller = diffrax.ConstantStepSize()
-        elif self.solver_name == "dopri5":
-            solver = diffrax.Dopri5()
-            stepsize_controller = diffrax.PIDController(rtol=self.rtol, atol=self.atol)
-        else:
-            raise ValueError(f"Unknown solver: {self.solver_name}")
+        solver = diffrax.Euler()
+        stepsize_controller = diffrax.ConstantStepSize()
 
         if return_traj:
             saveat = diffrax.SaveAt(ts=jnp.linspace(0.0, self.T, num_traj_pts))
         else:
             saveat = diffrax.SaveAt(t1=True)
+
+        n_steps = int(self.T / self.dt0)
 
         sol = diffrax.diffeqsolve(
             term, solver,
@@ -266,34 +240,18 @@ class SlotAttentionODE(eqx.Module):
             y0=slots_0, args=(k, v),
             saveat=saveat,
             stepsize_controller=stepsize_controller,
-            max_steps=self.max_steps,
-            throw=False,
+            max_steps=n_steps + 16,
         )
 
         if return_traj:
-            traj = sol.ys # [num_traj_pts, B, N_slots, D_slot]
+            traj = sol.ys
             slots_final = traj[-1]
             return slots_final, traj
         else:
-            slots_final = sol.ys[0] # sol.ys, [1, B, N_slots, D_slot] (only save t1)
+            slots_final = sol.ys[0]
             return slots_final
 
 class SlotODEModel(eqx.Module):
-    """Complete SlotODE autoencoder.
-
-    Usage:
-        key = jax.random.key(0)
-        model = SlotODEModel(key=key)
-
-        # forward pass (need a fresh key for slot initialization randomness)
-        key, subkey = jax.random.split(key)
-        recon, masks, slots = model(images, key=subkey)
-
-        # JIT-compiled forward:
-        @eqx.filter_jit
-        def forward(model, images, key):
-            return model(images, key=key)
-    """
     resolution: tuple
     num_slots: int
 
@@ -302,9 +260,8 @@ class SlotODEModel(eqx.Module):
     dec: SpatialBroadcastDecoder
 
     def __init__(self, resolution: tuple = (64, 64), num_slots: int = 7, slot_dim: int = 64, enc_hidden_dim: int = 64,
-                 num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False,
-                 rtol: float = 1e-3, atol: float = 1e-6, max_steps: int = 256, *, key: jax.Array):
+                 num_iter: int = 3, dt0: float = 1.0,
+                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
         k_enc, k_sa, k_dec = jax.random.split(key, 3)
 
         self.resolution = resolution
@@ -314,8 +271,8 @@ class SlotODEModel(eqx.Module):
 
         self.slot_attention_ode = SlotAttentionODE(
             num_slots=num_slots, slot_dim=slot_dim, enc_dim=enc_hidden_dim,
-            num_iter=num_iter, solver=solver, dt0=dt0, d_emb=d_emb, n_freq=n_freq,
-            autonomous=autonomous, rtol=rtol, atol=atol, max_steps=max_steps, key=k_sa
+            num_iter=num_iter, dt0=dt0, d_emb=d_emb, n_freq=n_freq,
+            autonomous=autonomous, key=k_sa
         )
 
         self.dec = SpatialBroadcastDecoder(slot_dim, resolution, dec_hidden_dim=enc_hidden_dim, key=k_dec)
@@ -331,7 +288,7 @@ class SlotODEModel(eqx.Module):
             slots: [B, N_slots, D_slot]
             (if return_traj) traj: [T, B, N_slots, D_slot]
         """
-        enc_feat = self.enc(image) # [B, H * W, C]
+        enc_feat = self.enc(image)
 
         if return_traj:
             slots, traj = self.slot_attention_ode(enc_feat, key, return_traj=True)
