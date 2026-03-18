@@ -323,6 +323,12 @@ def parse_args():
                    help="Number of sinusoidal frequencies in hypernet")
     p.add_argument("--autonomous",     action="store_true",
                    help="Use autonomous ODE (fixed weights, no hypernetwork)")
+    p.add_argument("--rtol",           type=float, default=1e-3,
+                   help="Relative tolerance for adaptive solvers (Dopri5)")
+    p.add_argument("--atol",           type=float, default=1e-6,
+                   help="Absolute tolerance for adaptive solvers (Dopri5)")
+    p.add_argument("--max_steps",      type=int,   default=256,
+                   help="Max ODE solver steps per forward pass")
     p.add_argument("--log_every",      type=int,   default=100)
     p.add_argument("--val_every",      type=int,   default=5_000)
     p.add_argument("--img_every",      type=int,   default=5_000)
@@ -363,7 +369,9 @@ def train(args):
             slot_dim=args.slot_dim, enc_hidden_dim=args.enc_hidden_dim,
             num_iter=args.num_iter, solver=args.solver, dt0=dt0,
             d_emb=args.d_emb, n_freq=args.n_freq,
-            autonomous=args.autonomous, key=model_key
+            autonomous=args.autonomous,
+            rtol=args.rtol, atol=args.atol, max_steps=args.max_steps,
+            key=model_key
         )
     else:
         model = SlotAttentionModel(

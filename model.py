@@ -171,6 +171,9 @@ class SlotAttentionODE(eqx.Module):
     T: float # integration time
     solver_name: str = eqx.field(static=True)
     dt0: float = eqx.field(static=True)
+    rtol: float = eqx.field(static=True)
+    atol: float = eqx.field(static=True)
+    max_steps: int = eqx.field(static=True)
 
     # learnable slot initialization
     slots_mu: jax.Array # [1, num_slots, slot_dim]
@@ -188,7 +191,8 @@ class SlotAttentionODE(eqx.Module):
     slot_ode_func: SlotODEFunc
 
     def __init__(self, num_slots: int, slot_dim: int, enc_dim: int, num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
+                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False,
+                 rtol: float = 1e-3, atol: float = 1e-6, max_steps: int = 256, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.num_slots = num_slots
@@ -196,6 +200,9 @@ class SlotAttentionODE(eqx.Module):
         self.T = float(num_iter)
         self.solver_name = solver
         self.dt0 = dt0
+        self.rtol = rtol
+        self.atol = atol
+        self.max_steps = max_steps
 
         self.slots_mu = jax.random.normal(k1, (1, 1, slot_dim))
 
@@ -244,7 +251,7 @@ class SlotAttentionODE(eqx.Module):
             stepsize_controller = diffrax.ConstantStepSize()
         elif self.solver_name == "dopri5":
             solver = diffrax.Dopri5()
-            stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+            stepsize_controller = diffrax.PIDController(rtol=self.rtol, atol=self.atol)
         else:
             raise ValueError(f"Unknown solver: {self.solver_name}")
 
@@ -259,7 +266,7 @@ class SlotAttentionODE(eqx.Module):
             y0=slots_0, args=(k, v),
             saveat=saveat,
             stepsize_controller=stepsize_controller,
-            max_steps=256,
+            max_steps=self.max_steps,
         )
 
         if return_traj:
@@ -295,7 +302,8 @@ class SlotODEModel(eqx.Module):
 
     def __init__(self, resolution: tuple = (64, 64), num_slots: int = 7, slot_dim: int = 64, enc_hidden_dim: int = 64,
                  num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
+                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False,
+                 rtol: float = 1e-3, atol: float = 1e-6, max_steps: int = 256, *, key: jax.Array):
         k_enc, k_sa, k_dec = jax.random.split(key, 3)
 
         self.resolution = resolution
@@ -306,7 +314,7 @@ class SlotODEModel(eqx.Module):
         self.slot_attention_ode = SlotAttentionODE(
             num_slots=num_slots, slot_dim=slot_dim, enc_dim=enc_hidden_dim,
             num_iter=num_iter, solver=solver, dt0=dt0, d_emb=d_emb, n_freq=n_freq,
-            autonomous=autonomous, key=k_sa
+            autonomous=autonomous, rtol=rtol, atol=atol, max_steps=max_steps, key=k_sa
         )
 
         self.dec = SpatialBroadcastDecoder(slot_dim, resolution, dec_hidden_dim=enc_hidden_dim, key=k_dec)
