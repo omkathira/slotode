@@ -267,6 +267,7 @@ class SlotAttentionODE(eqx.Module):
             saveat=saveat,
             stepsize_controller=stepsize_controller,
             max_steps=self.max_steps,
+            throw=False,
         )
 
         if return_traj:
