@@ -70,73 +70,98 @@ class TimeDepWeight(eqx.Module):
         return w.reshape(self.d_out, self.d_in)
 
 class SlotODEFunc(eqx.Module):
-    # time-dependent weight generators
-    tdw_q: TimeDepWeight # generates Q projection, [slot_dim, slot_dim]
-    tdw_gate: TimeDepWeight # generates gate projection, [slot_dim, 2 * slot_dim]
-    tdw_ff0: TimeDepWeight # generates feedforward layer 0, [mlp_hidden, 2 * slot_dim]
-    tdw_ff1: TimeDepWeight # generates feedforward layer 1, [slot_dim, mlp_hidden]
- 
+    """ODE vector field for slot dynamics.
+
+    When autonomous=False (default): time-dependent weights via hypernetworks.
+    When autonomous=True: fixed learned weight matrices — the vector field
+    depends only on the slot state, giving fixed-point convergence guarantees.
+    """
+    # time-dependent weight generators (used when autonomous=False)
+    tdw_q: TimeDepWeight | None
+    tdw_gate: TimeDepWeight | None
+    tdw_ff0: TimeDepWeight | None
+    tdw_ff1: TimeDepWeight | None
+
+    # fixed weight matrices (used when autonomous=True)
+    W_q: jax.Array | None
+    W_gate: jax.Array | None
+    W_ff0: jax.Array | None
+    W_ff1: jax.Array | None
+
     norm_attn: eqx.nn.LayerNorm
     norm_ff: eqx.nn.LayerNorm
     scale: float
- 
+
     slot_dim: int = eqx.field(static=True)
     mlp_hidden: int = eqx.field(static=True)
- 
-    def __init__(self, slot_dim: int, mlp_hidden: int = 128, d_emb: int = 32, n_freq: int = 16, *, key: jax.Array):
+    autonomous: bool = eqx.field(static=True)
+
+    def __init__(self, slot_dim: int, mlp_hidden: int = 128, d_emb: int = 32, n_freq: int = 16,
+                 autonomous: bool = False, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.scale = slot_dim ** -0.5
         self.slot_dim = slot_dim
         self.mlp_hidden = mlp_hidden
+        self.autonomous = autonomous
 
-        self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k1)
-        self.tdw_gate = TimeDepWeight(2 * slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k2)
-        self.tdw_ff0 = TimeDepWeight(2 * slot_dim, mlp_hidden, d_emb=d_emb, n_freq=n_freq, key=k3)
-        self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k4)
- 
+        if autonomous:
+            self.tdw_q = self.tdw_gate = self.tdw_ff0 = self.tdw_ff1 = None
+            scale_q = (slot_dim ** -0.5)
+            scale_gate = ((2 * slot_dim) ** -0.5)
+            scale_ff0 = ((2 * slot_dim) ** -0.5)
+            scale_ff1 = (mlp_hidden ** -0.5)
+            self.W_q = jax.random.normal(k1, (slot_dim, slot_dim)) * scale_q
+            self.W_gate = jax.random.normal(k2, (slot_dim, 2 * slot_dim)) * scale_gate
+            self.W_ff0 = jax.random.normal(k3, (mlp_hidden, 2 * slot_dim)) * scale_ff0
+            self.W_ff1 = jax.random.normal(k4, (slot_dim, mlp_hidden)) * scale_ff1
+        else:
+            self.W_q = self.W_gate = self.W_ff0 = self.W_ff1 = None
+            self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k1)
+            self.tdw_gate = TimeDepWeight(2 * slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k2)
+            self.tdw_ff0 = TimeDepWeight(2 * slot_dim, mlp_hidden, d_emb=d_emb, n_freq=n_freq, key=k3)
+            self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k4)
+
         self.norm_attn = eqx.nn.LayerNorm(slot_dim)
         self.norm_ff = eqx.nn.LayerNorm(slot_dim)
- 
+
     def __call__(self, t: float, slots: jax.Array, args: tuple) -> jax.Array:
         """
         slots: [B, N_slots, slot_dim]
         args: (k, v) — precomputed keys and values that remain fixed
           k: [B, N_feat, slot_dim]
           v: [B, N_feat, slot_dim]
- 
+
         returns: velocity [B, N_slots, slot_dim]
         """
         k, v = args
- 
-        # time-dependent weights
-        W_q = self.tdw_q(t) # [slot_dim, slot_dim]
-        W_gate = self.tdw_gate(t) # [slot_dim, 2 * slot_dim]
-        W_ff0 = self.tdw_ff0(t) # [mlp_hidden, 2 * slot_dim]
-        W_ff1 = self.tdw_ff1(t) # [slot_dim, mlp_hidden_dim]
- 
-        # --- f: cross-attention ---
+
+        if self.autonomous:
+            Wq, Wg, Wf0, Wf1 = self.W_q, self.W_gate, self.W_ff0, self.W_ff1
+        else:
+            Wq = self.tdw_q(t)
+            Wg = self.tdw_gate(t)
+            Wf0 = self.tdw_ff0(t)
+            Wf1 = self.tdw_ff1(t)
+
         slots_norm = jax.vmap(jax.vmap(self.norm_attn))(slots)
-        q = jnp.einsum('bnd,od->bno', slots_norm, W_q)
- 
+        q = jnp.einsum('bnd,od->bno', slots_norm, Wq)
+
         att_logits = jnp.einsum('bnd,bmd->bnm', q, k) * self.scale
         att = jax.nn.softmax(att_logits, axis=1)
         att = att / (att.sum(axis=-1, keepdims=True) + 1e-8)
         f_attn = jnp.einsum('bnm,bmd->bnd', att, v)
- 
-        # --- gate: per-dimension modulation of attention signal ---
-        gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1) # [B, N_slots, 2 * slot_dim]
-        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, W_gate)) # [B, N, slot_dim]
- 
-        # --- g: informed feedforward (sees both slot state and attention output) ---
+
+        gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1)
+        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, Wg))
+
         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
-        ff_input = jnp.concatenate([slots_ff, f_attn], axis=-1) # [B, N_slots, 2 * slot_dim]
-        h = jnp.einsum('bnd,od->bno', ff_input, W_ff0) # [B, N_slots, mlp_hidden_dim]
+        ff_input = jnp.concatenate([slots_ff, f_attn], axis=-1)
+        h = jnp.einsum('bnd,od->bno', ff_input, Wf0)
         h = jax.nn.relu(h)
-        h = jnp.einsum('bnd,od->bno', h, W_ff1) # [B, N_slots, slot_dim]
-        g_ff = h
- 
-        return gate * f_attn + g_ff # velocity, [B, N_slots, slot_dim]
+        h = jnp.einsum('bnd,od->bno', h, Wf1)
+
+        return gate * f_attn + h
 
 # slot attention as a continuous-time neural dynamical system
 class SlotAttentionODE(eqx.Module):
@@ -163,7 +188,7 @@ class SlotAttentionODE(eqx.Module):
     slot_ode_func: SlotODEFunc
 
     def __init__(self, num_slots: int, slot_dim: int, enc_dim: int, num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, *, key: jax.Array):
+                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.num_slots = num_slots
@@ -173,18 +198,16 @@ class SlotAttentionODE(eqx.Module):
         self.dt0 = dt0
 
         self.slots_mu = jax.random.normal(k1, (1, 1, slot_dim))
-        # self.slots_log_sigma = jnp.zeros((1, 1, slot_dim))
 
         self.slots_log_sigma = jnp.full((1, 1, slot_dim), math.log(2.0))
 
         self.norm_input = eqx.nn.LayerNorm(enc_dim)
         self.fc_input = eqx.nn.Linear(enc_dim, slot_dim, key=k2)
 
-        # fixed K and V projections (precomputed once per forward pass)
         self.to_k = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k3)
         self.to_v = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k4)
 
-        self.slot_ode_func = SlotODEFunc(slot_dim, d_emb=d_emb, n_freq=n_freq, key=key)
+        self.slot_ode_func = SlotODEFunc(slot_dim, d_emb=d_emb, n_freq=n_freq, autonomous=autonomous, key=key)
 
     def initialize_slots(self, batch_size: int, key: jax.Array) -> jax.Array: # sample initial slots from a learned gaussian
         mu = jnp.broadcast_to(self.slots_mu, (batch_size, self.num_slots, self.slot_dim)) # [B, N_slots, slot_dim]
@@ -272,7 +295,7 @@ class SlotODEModel(eqx.Module):
 
     def __init__(self, resolution: tuple = (64, 64), num_slots: int = 7, slot_dim: int = 64, enc_hidden_dim: int = 64,
                  num_iter: int = 3, solver: str = "euler", dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, *, key: jax.Array):
+                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
         k_enc, k_sa, k_dec = jax.random.split(key, 3)
 
         self.resolution = resolution
@@ -282,7 +305,8 @@ class SlotODEModel(eqx.Module):
 
         self.slot_attention_ode = SlotAttentionODE(
             num_slots=num_slots, slot_dim=slot_dim, enc_dim=enc_hidden_dim,
-            num_iter=num_iter, solver=solver, dt0=dt0, d_emb=d_emb, n_freq=n_freq, key=k_sa
+            num_iter=num_iter, solver=solver, dt0=dt0, d_emb=d_emb, n_freq=n_freq,
+            autonomous=autonomous, key=k_sa
         )
 
         self.dec = SpatialBroadcastDecoder(slot_dim, resolution, dec_hidden_dim=enc_hidden_dim, key=k_dec)
