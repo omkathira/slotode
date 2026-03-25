@@ -169,10 +169,7 @@ class SlotAttentionODE(eqx.Module):
         stepsize_controller = diffrax.ConstantStepSize()
 
         if return_traj:
-            # save at actual solver steps to avoid interpolation artifacts
-            ts = jnp.arange(0.0, self.T + self.dt0, self.dt0)
-            ts = jnp.clip(ts, 0.0, self.T)  # don't overshoot t1
-            saveat = diffrax.SaveAt(ts=ts)
+            saveat = diffrax.SaveAt(ts=jnp.linspace(0.0, self.T, int(self.T / self.dt0) + 1))
         else:
             saveat = diffrax.SaveAt(t1=True)
 
