@@ -327,12 +327,6 @@ def parse_args():
     p.add_argument("--num_iter",       type=int,   default=3)
     p.add_argument("--dt",             type=float, default=None,
                    help="ODE integration step size (default: 1.0)")
-    p.add_argument("--d_emb",          type=int,   default=64,
-                   help="Hypernet MLP embedding dim")
-    p.add_argument("--n_freq",         type=int,   default=128,
-                   help="Number of sinusoidal frequencies in hypernet")
-    p.add_argument("--autonomous",     action="store_true",
-                   help="Use autonomous ODE (fixed weights, no hypernetwork)")
     p.add_argument("--log_every",      type=int,   default=100)
     p.add_argument("--val_every",      type=int,   default=5_000)
     p.add_argument("--img_every",      type=int,   default=5_000)
@@ -372,8 +366,6 @@ def train(args):
             resolution=(res, res), num_slots=args.num_slots,
             slot_dim=args.slot_dim, enc_hidden_dim=args.enc_hidden_dim,
             num_iter=args.num_iter, dt0=dt0,
-            d_emb=args.d_emb, n_freq=args.n_freq,
-            autonomous=args.autonomous,
             key=model_key
         )
     else:

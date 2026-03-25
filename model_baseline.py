@@ -85,7 +85,7 @@ class SlotAttention(eqx.Module):
 
         # iterative refinement
         # a plain Python for loop is fine here since num_iter is small and fixed (jax.lax.fori_loop would be better for JIT efficiency)
-        for _ in range(self.num_iter):
+        for _ in range(self.num_iter): # T
             slots_prev = slots
 
             # normalize and compute Q

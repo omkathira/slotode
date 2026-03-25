@@ -6,87 +6,48 @@ import diffrax
 
 from model_utils import Encoder, SpatialBroadcastDecoder
 
-# hypernetwork
-class TimeDepWeight(eqx.Module):
-    """Generates a weight matrix W(t) as a function of continuous time t.
+"""
+standard slot attention: slots ← slots + f(slots, features)
 
-    Architecture (following DiffEqFormer, Tong et al. 2025):
-        W(t) = Proj(MLP(Sinusoidal(t)))
+slot attention as an autonomous neural ODE, no dependence on time: d(slots)/dt = f(slots)
 
-    - Sinusoidal: scalar t -> Concat(t, sin(w*t), cos(w*t)) with log-spaced
-      frequencies w, giving a rich multi-scale time representation.
-    - MLP: 2-layer network with SiLU activation.
-    - Proj: linear projection reshaped to (d_out, d_in) weight matrix.
+1. encoder: [B, 3, H, W] -> [B, N_feat, D_enc] <--- original to locatellos paper
 
-    Each weight matrix (Q, MLP_0, MLP_1) gets its own MLP+Proj head but
-    shares the same sinusoidal frequency vector (following Figure 17 left).
-    """
-    # fixed sinusoidal frequencies (not trainable)
-    freqs: jax.Array # [n_freq]
+2. slot init: slots_0, [B, N_slots, D_slot], learnable gaussian
 
-    # MLP, sinusoidal_dim -> d_emb -> d_emb
-    mlp_0: eqx.nn.Linear
-    mlp_1: eqx.nn.Linear
+3. scene representation is fixed over integration time - precompute K and v:
+    k = to_k(feat)
+    v = to_v(feat)
 
-    # projection, d_emb -> d_out * d_in
-    proj: eqx.nn.Linear
+4. Slot attention:
+    q = slots_norm @ Wq
+    att = softmax(q @ k^T)
+    f_attn = att @ v
 
-    d_in: int = eqx.field(static=True)
-    d_out: int = eqx.field(static=True)
+5. Attention gate - how much of the attention should affect slot representations
+    gate = sigmoid([slots, f_attn] @ Wg)
 
-    def __init__(self, d_in: int, d_out: int, d_emb: int = 32, n_freq: int = 16, *, key: jax.Array):
-        k1, k2, k3 = jax.random.split(key, 3)
+6. MLP update (like a transformer FFN, just a nonlinear transformation)
+    h = ReLU([slots, f_attn] @ Wf0)
+    h = h @ Wf1
 
-        self.d_in = d_in
-        self.d_out = d_out
+7. Final velocity
+    dslots/dt = gate * f_attn + h
 
-        # log-spaced frequencies: w_i = -log(10^4) * i / n_freq
-        self.freqs = -math.log(1e4) * jnp.arange(n_freq) / n_freq
-
-        # sinusoidal input dim: t + sin(w*t) + cos(w*t) = 1 + 2*n_freq
-        sin_dim = 1 + 2 * n_freq
-
-        # 2-layer MLP with SiLU
-        self.mlp_0 = eqx.nn.Linear(sin_dim, d_emb, key=k1)
-        self.mlp_1 = eqx.nn.Linear(d_emb, d_emb, key=k2)
-
-        # project to flattened weight matrix
-        self.proj = eqx.nn.Linear(d_emb, d_out * d_in, key=k3)
-
-    def __call__(self, t: float) -> jax.Array:
-        """Map scalar t -> weight matrix [d_out, d_in]."""
-        # sinusoidal embedding
-        wt = self.freqs * t  # [n_freq]
-        emb = jnp.concatenate([jnp.array([t]), jnp.sin(wt), jnp.cos(wt)])
-
-        # MLP with SiLU activation
-        h = self.mlp_0(emb)
-        h = jax.nn.silu(h)
-        h = self.mlp_1(h)
-        h = jax.nn.silu(h)
-
-        # project and reshape to weight matrix
-        w = self.proj(h)
-        return w.reshape(self.d_out, self.d_in)
+8. Decoder <--- original to locatellos paper
+"""
 
 class SlotODEFunc(eqx.Module):
-    """ODE vector field for slot dynamics.
+    """Autonomous ODE vector field for slot dynamics.
 
-    When autonomous=False (default): time-dependent weights via hypernetworks.
-    When autonomous=True: fixed learned weight matrices — the vector field
-    depends only on the slot state, giving fixed-point convergence guarantees.
+    The vector field depends only on the slot state (and fixed scene features),
+    not on time — giving an autonomous system amenable to fixed-point and
+    stability analysis.
     """
-    # time-dependent weight generators (used when autonomous=False)
-    tdw_q: TimeDepWeight | None
-    tdw_gate: TimeDepWeight | None
-    tdw_ff0: TimeDepWeight | None
-    tdw_ff1: TimeDepWeight | None
-
-    # fixed weight matrices (used when autonomous=True)
-    W_q: jax.Array | None
-    W_gate: jax.Array | None
-    W_ff0: jax.Array | None
-    W_ff1: jax.Array | None
+    W_q: jax.Array
+    W_gate: jax.Array
+    W_ff0: jax.Array
+    W_ff1: jax.Array
 
     norm_attn: eqx.nn.LayerNorm
     norm_ff: eqx.nn.LayerNorm
@@ -94,29 +55,18 @@ class SlotODEFunc(eqx.Module):
 
     slot_dim: int = eqx.field(static=True)
     mlp_hidden: int = eqx.field(static=True)
-    autonomous: bool = eqx.field(static=True)
 
-    def __init__(self, slot_dim: int, mlp_hidden: int = 128, d_emb: int = 32, n_freq: int = 16,
-                 autonomous: bool = False, *, key: jax.Array):
+    def __init__(self, slot_dim: int, mlp_hidden: int = 128, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.scale = slot_dim ** -0.5
         self.slot_dim = slot_dim
         self.mlp_hidden = mlp_hidden
-        self.autonomous = autonomous
 
-        if autonomous:
-            self.tdw_q = self.tdw_gate = self.tdw_ff0 = self.tdw_ff1 = None
-            self.W_q = jax.random.normal(k1, (slot_dim, slot_dim)) * (slot_dim ** -0.5)
-            self.W_gate = jax.random.normal(k2, (slot_dim, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
-            self.W_ff0 = jax.random.normal(k3, (mlp_hidden, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
-            self.W_ff1 = jax.random.normal(k4, (slot_dim, mlp_hidden)) * (mlp_hidden ** -0.5)
-        else:
-            self.W_q = self.W_gate = self.W_ff0 = self.W_ff1 = None
-            self.tdw_q = TimeDepWeight(slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k1)
-            self.tdw_gate = TimeDepWeight(2 * slot_dim, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k2)
-            self.tdw_ff0 = TimeDepWeight(2 * slot_dim, mlp_hidden, d_emb=d_emb, n_freq=n_freq, key=k3)
-            self.tdw_ff1 = TimeDepWeight(mlp_hidden, slot_dim, d_emb=d_emb, n_freq=n_freq, key=k4)
+        self.W_q = jax.random.normal(k1, (slot_dim, slot_dim)) * (slot_dim ** -0.5)
+        self.W_gate = jax.random.normal(k2, (slot_dim, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
+        self.W_ff0 = jax.random.normal(k3, (mlp_hidden, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
+        self.W_ff1 = jax.random.normal(k4, (slot_dim, mlp_hidden)) * (mlp_hidden ** -0.5)
 
         self.norm_attn = eqx.nn.LayerNorm(slot_dim)
         self.norm_ff = eqx.nn.LayerNorm(slot_dim)
@@ -132,16 +82,8 @@ class SlotODEFunc(eqx.Module):
         """
         k, v = args
 
-        if self.autonomous:
-            Wq, Wg, Wf0, Wf1 = self.W_q, self.W_gate, self.W_ff0, self.W_ff1
-        else:
-            Wq = self.tdw_q(t)
-            Wg = self.tdw_gate(t)
-            Wf0 = self.tdw_ff0(t)
-            Wf1 = self.tdw_ff1(t)
-
         slots_norm = jax.vmap(jax.vmap(self.norm_attn))(slots)
-        q = jnp.einsum('bnd,od->bno', slots_norm, Wq)
+        q = jnp.einsum('bnd,od->bno', slots_norm, self.W_q)
 
         att_logits = jnp.einsum('bnd,bmd->bnm', q, k) * self.scale
         att = jax.nn.softmax(att_logits, axis=1)
@@ -149,13 +91,14 @@ class SlotODEFunc(eqx.Module):
         f_attn = jnp.einsum('bnm,bmd->bnd', att, v)
 
         gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1)
-        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, Wg))
+        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, self.W_gate))
 
+        # residual MLP
         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
         ff_input = jnp.concatenate([slots_ff, f_attn], axis=-1)
-        h = jnp.einsum('bnd,od->bno', ff_input, Wf0)
+        h = jnp.einsum('bnd,od->bno', ff_input, self.W_ff0)
         h = jax.nn.relu(h)
-        h = jnp.einsum('bnd,od->bno', h, Wf1)
+        h = jnp.einsum('bnd,od->bno', h, self.W_ff1)
 
         return gate * f_attn + h
 
@@ -168,7 +111,7 @@ class SlotAttentionODE(eqx.Module):
     dt0: float = eqx.field(static=True)
 
     # learnable slot initialization
-    slots_mu: jax.Array # [1, num_slots, slot_dim]
+    slots_mu: jax.Array # [1, 1, slot_dim]
     slots_log_sigma: jax.Array # [1, 1, slot_dim]
 
     # input projection
@@ -179,11 +122,11 @@ class SlotAttentionODE(eqx.Module):
     to_k: eqx.nn.Linear
     to_v: eqx.nn.Linear
 
-    # ODE/SDE dynamics (Q(t), feedforward network, and noise coefficient)
+    # ODE dynamics
     slot_ode_func: SlotODEFunc
 
     def __init__(self, num_slots: int, slot_dim: int, enc_dim: int, num_iter: int = 3, dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
+                 *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.num_slots = num_slots
@@ -200,7 +143,7 @@ class SlotAttentionODE(eqx.Module):
         self.to_k = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k3)
         self.to_v = eqx.nn.Linear(slot_dim, slot_dim, use_bias=False, key=k4)
 
-        self.slot_ode_func = SlotODEFunc(slot_dim, d_emb=d_emb, n_freq=n_freq, autonomous=autonomous, key=key)
+        self.slot_ode_func = SlotODEFunc(slot_dim, key=key)
 
     def initialize_slots(self, batch_size: int, key: jax.Array) -> jax.Array:
         mu = jnp.broadcast_to(self.slots_mu, (batch_size, self.num_slots, self.slot_dim))
@@ -208,9 +151,8 @@ class SlotAttentionODE(eqx.Module):
         noise = jax.random.normal(key, mu.shape)
         return mu + sigma * noise # [B, N_slots, slot_dim]
 
-    def __call__(self, enc_feat: jax.Array, key: jax.Array, return_traj: bool = False,
-                 num_traj_pts: int = 20) -> tuple:
-        B = enc_feat.shape[0]
+    def __call__(self, enc_feat: jax.Array, key: jax.Array, return_traj: bool = False) -> tuple:
+        B = enc_feat.shape[0] # enc_feat is of shape [B, N_feat, D_enc] where N_feat = H * W
 
         # project input features and precompute K and V
         feat_norm = jax.vmap(jax.vmap(self.norm_input))(enc_feat) # [B, N_feat, D_enc]
@@ -227,7 +169,10 @@ class SlotAttentionODE(eqx.Module):
         stepsize_controller = diffrax.ConstantStepSize()
 
         if return_traj:
-            saveat = diffrax.SaveAt(ts=jnp.linspace(0.0, self.T, num_traj_pts))
+            # save at actual solver steps to avoid interpolation artifacts
+            ts = jnp.arange(0.0, self.T + self.dt0, self.dt0)
+            ts = jnp.clip(ts, 0.0, self.T)  # don't overshoot t1
+            saveat = diffrax.SaveAt(ts=ts)
         else:
             saveat = diffrax.SaveAt(t1=True)
 
@@ -259,8 +204,7 @@ class SlotODEModel(eqx.Module):
     dec: SpatialBroadcastDecoder
 
     def __init__(self, resolution: tuple = (64, 64), num_slots: int = 7, slot_dim: int = 64, enc_hidden_dim: int = 64,
-                 num_iter: int = 3, dt0: float = 1.0,
-                 d_emb: int = 32, n_freq: int = 16, autonomous: bool = False, *, key: jax.Array):
+                 num_iter: int = 3, dt0: float = 1.0, *, key: jax.Array):
         k_enc, k_sa, k_dec = jax.random.split(key, 3)
 
         self.resolution = resolution
@@ -270,8 +214,7 @@ class SlotODEModel(eqx.Module):
 
         self.slot_attention_ode = SlotAttentionODE(
             num_slots=num_slots, slot_dim=slot_dim, enc_dim=enc_hidden_dim,
-            num_iter=num_iter, dt0=dt0, d_emb=d_emb, n_freq=n_freq,
-            autonomous=autonomous, key=k_sa
+            num_iter=num_iter, dt0=dt0, key=k_sa
         )
 
         self.dec = SpatialBroadcastDecoder(slot_dim, resolution, dec_hidden_dim=enc_hidden_dim, key=k_dec)

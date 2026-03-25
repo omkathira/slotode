@@ -51,6 +51,7 @@ import pickle
 from pathlib import Path
 
 import jax
+jax.config.update("jax_default_matmul_precision", "highest")
 import jax.numpy as jnp
 import equinox as eqx
 import numpy as np
@@ -259,9 +260,7 @@ def evaluate(args):
             slot_dim=ckpt_args['slot_dim'],
             enc_hidden_dim=ckpt_args['enc_hidden_dim'],
             num_iter=ckpt_args['num_iter'],
-            solver=ckpt_args.get('solver', 'tsit5'),
-            d_emb=ckpt_args.get('d_emb', 64),
-            n_freq=ckpt_args.get('n_freq', 128),
+            dt0=ckpt_args.get('dt', 1.0),
             key=key,
         )
     else:
