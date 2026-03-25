@@ -44,12 +44,6 @@ class SlotODEFunc(eqx.Module):
     not on time — giving an autonomous system amenable to fixed-point and
     stability analysis.
     """
-    # dead fields preserved for TPU XLA compilation compatibility
-    _unused_0: None
-    _unused_1: None
-    _unused_2: None
-    _unused_3: None
-
     W_q: jax.Array
     W_gate: jax.Array
     W_ff0: jax.Array
@@ -61,7 +55,6 @@ class SlotODEFunc(eqx.Module):
 
     slot_dim: int = eqx.field(static=True)
     mlp_hidden: int = eqx.field(static=True)
-    autonomous: bool = eqx.field(static=True)
 
     def __init__(self, slot_dim: int, mlp_hidden: int = 128, *, key: jax.Array):
         k1, k2, k3, k4 = jax.random.split(key, 4)
@@ -69,12 +62,6 @@ class SlotODEFunc(eqx.Module):
         self.scale = slot_dim ** -0.5
         self.slot_dim = slot_dim
         self.mlp_hidden = mlp_hidden
-        self.autonomous = True
-
-        self._unused_0 = None
-        self._unused_1 = None
-        self._unused_2 = None
-        self._unused_3 = None
 
         self.W_q = jax.random.normal(k1, (slot_dim, slot_dim)) * (slot_dim ** -0.5)
         self.W_gate = jax.random.normal(k2, (slot_dim, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
@@ -95,11 +82,8 @@ class SlotODEFunc(eqx.Module):
         """
         k, v = args
 
-        if self.autonomous:
-            Wq, Wg, Wf0, Wf1 = self.W_q, self.W_gate, self.W_ff0, self.W_ff1
-
         slots_norm = jax.vmap(jax.vmap(self.norm_attn))(slots)
-        q = jnp.einsum('bnd,od->bno', slots_norm, Wq)
+        q = jnp.einsum('bnd,od->bno', slots_norm, self.W_q)
 
         att_logits = jnp.einsum('bnd,bmd->bnm', q, k) * self.scale
         att = jax.nn.softmax(att_logits, axis=1)
@@ -107,14 +91,14 @@ class SlotODEFunc(eqx.Module):
         f_attn = jnp.einsum('bnm,bmd->bnd', att, v)
 
         gate_input = jnp.concatenate([slots_norm, f_attn], axis=-1)
-        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, Wg))
+        gate = jax.nn.sigmoid(jnp.einsum('bnd,od->bno', gate_input, self.W_gate))
 
         # residual MLP
         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
         ff_input = jnp.concatenate([slots_ff, f_attn], axis=-1)
-        h = jnp.einsum('bnd,od->bno', ff_input, Wf0)
+        h = jnp.einsum('bnd,od->bno', ff_input, self.W_ff0)
         h = jax.nn.relu(h)
-        h = jnp.einsum('bnd,od->bno', h, Wf1)
+        h = jnp.einsum('bnd,od->bno', h, self.W_ff1)
 
         return gate * f_attn + h
 

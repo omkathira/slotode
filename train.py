@@ -377,10 +377,6 @@ def train(args):
 
     n_params = sum(x.size for x in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
     print(f"Model: {args.model}  |  Parameters: {n_params:,}")
-    if args.model == "slot_ode":
-        sa = model.slot_attention_ode
-        n_steps = int(sa.T / sa.dt0)
-        print(f"  ODE config: T={sa.T}, dt0={sa.dt0}, n_steps={n_steps}, max_steps={n_steps + 16}")
 
     # ---- optimizer --------------------------------------------------------
     schedule = optax.join_schedules(
