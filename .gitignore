@@ -8,3 +8,4 @@ runs_data/
 .ipynb_checkpoints/
 *.pdf
 CLEVR_64/
+thesis_draft/
