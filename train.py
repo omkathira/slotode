@@ -158,7 +158,12 @@ def train_step(model, opt_state, optimizer, images, key):
     def loss_fn(model):
         # mixed precision: cast model + images to fp16 for forward pass
         if _USE_FP16:
-            model = _cast_tree(model, jnp.float16)
+            params, static = eqx.partition(model, eqx.is_array)
+            params = jax.tree.map(
+                lambda x: x.astype(jnp.float16) if jnp.issubdtype(x.dtype, jnp.floating) else x,
+                params
+            )
+            model = eqx.combine(params, static)
             images_fp = images.astype(jnp.float16)
         else:
             images_fp = images
