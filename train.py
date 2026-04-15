@@ -141,41 +141,16 @@ def mse_loss(recon: jax.Array, target: jax.Array) -> jax.Array:
 # Training step (JIT-compiled)
 # ---------------------------------------------------------------------------
 
-def _cast_tree(tree, dtype):
-    """Cast all float arrays in a pytree to dtype."""
-    def _cast(x):
-        if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
-            return x.astype(dtype)
-        return x
-    return jax.tree.map(_cast, tree)
-
-_USE_FP16 = jax.devices()[0].platform == "gpu"
-
 @eqx.filter_jit
 def train_step(model, opt_state, optimizer, images, key):
     """Single training step. Returns (model, opt_state, loss)."""
 
     def loss_fn(model):
-        # mixed precision: cast model + images to fp16 for forward pass
-        if _USE_FP16:
-            params, static = eqx.partition(model, eqx.is_array)
-            params = jax.tree.map(
-                lambda x: x.astype(jnp.float16) if jnp.issubdtype(x.dtype, jnp.floating) else x,
-                params
-            )
-            model = eqx.combine(params, static)
-            images_fp = images.astype(jnp.float16)
-        else:
-            images_fp = images
-        recon, masks, slots = model(images_fp, key=key)
-        loss = mse_loss(recon, images_fp)
+        recon, masks, slots = model(images, key=key)
+        loss = mse_loss(recon, images)
         return loss
 
     loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-
-    # cast grads back to float32 for stable optimizer update
-    if _USE_FP16:
-        grads = _cast_tree(grads, jnp.float32)
 
     updates, opt_state = optimizer.update(
         grads, opt_state, eqx.filter(model, eqx.is_array)
@@ -400,6 +375,13 @@ def train(args):
             num_iter=args.num_iter, key=model_key
         )
 
+    # GPU: initialize model in float16 to match TPU's automatic bfloat16
+    if jax.devices()[0].platform == "gpu":
+        model = jax.tree.map(
+            lambda x: x.astype(jnp.float16) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
+            model
+        )
+
     n_params = sum(x.size for x in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
     print(f"Model: {args.model}  |  Parameters: {n_params:,}")
 
@@ -451,6 +433,8 @@ def train(args):
         while not done:
             for imgs, _, _ in train_ds:
                 imgs_jax = jnp.array(imgs)
+                if jax.devices()[0].platform == "gpu":
+                    imgs_jax = imgs_jax.astype(jnp.float16)
 
                 key, subkey = jax.random.split(key)
 
