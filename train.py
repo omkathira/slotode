@@ -141,16 +141,36 @@ def mse_loss(recon: jax.Array, target: jax.Array) -> jax.Array:
 # Training step (JIT-compiled)
 # ---------------------------------------------------------------------------
 
+def _cast_tree(tree, dtype):
+    """Cast all float arrays in a pytree to dtype."""
+    def _cast(x):
+        if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
+            return x.astype(dtype)
+        return x
+    return jax.tree.map(_cast, tree)
+
+_USE_FP16 = jax.devices()[0].platform == "gpu"
+
 @eqx.filter_jit
 def train_step(model, opt_state, optimizer, images, key):
     """Single training step. Returns (model, opt_state, loss)."""
 
     def loss_fn(model):
-        recon, masks, slots = model(images, key=key)
-        loss = mse_loss(recon, images)
+        # mixed precision: cast model + images to fp16 for forward pass
+        if _USE_FP16:
+            model = _cast_tree(model, jnp.float16)
+            images_fp = images.astype(jnp.float16)
+        else:
+            images_fp = images
+        recon, masks, slots = model(images_fp, key=key)
+        loss = mse_loss(recon, images_fp)
         return loss
 
     loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+
+    # cast grads back to float32 for stable optimizer update
+    if _USE_FP16:
+        grads = _cast_tree(grads, jnp.float32)
 
     updates, opt_state = optimizer.update(
         grads, opt_state, eqx.filter(model, eqx.is_array)
