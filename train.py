@@ -375,7 +375,7 @@ def train(args):
             num_iter=args.num_iter, key=model_key
         )
 
-    # GPU: initialize model in float16 to match TPU's automatic bfloat16
+    # GPU: cast model to float16 to fit in VRAM (matches TPU's bfloat16 compute)
     if jax.devices()[0].platform == "gpu":
         model = jax.tree.map(
             lambda x: x.astype(jnp.float16) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,

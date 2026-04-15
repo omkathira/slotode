@@ -158,9 +158,18 @@ class SpatialBroadcastDecoder(eqx.Module):
         """
         B, N_slots, D = slots.shape
 
-        # decode each slot independently, vmap over batch, then vmap over slots
-        decode_batch_slots = jax.vmap(jax.vmap(self.decode_single))
-        x = decode_batch_slots(slots) # [B, N_slots, 4, H, W]
+        # --- CHANGED: use eqx.filter_vmap so decoder weights are dynamic leaves,
+        #     allowing dtype casts (e.g. float16 on GPU) to propagate through.
+        #     Original used jax.vmap which captured self in a static closure,
+        #     preventing tree-level float16 casts from reaching conv weights.
+        # --- ORIGINAL (revert to this if needed):
+        # decode_batch_slots = jax.vmap(jax.vmap(self.decode_single))
+        # x = decode_batch_slots(slots) # [B, N_slots, 4, H, W]
+        # --- NEW:
+        decode_batch_slots = eqx.filter_vmap(eqx.filter_vmap(
+            lambda dec, s: dec.decode_single(s),
+            in_axes=(None, 0)), in_axes=(None, 0))
+        x = decode_batch_slots(self, slots) # [B, N_slots, 4, H, W]
 
         recons = x[:, :, :3, :, :] # [B, N_slots, 3, H, W]
         mask_logits = x[:, :, 3, :, :] # [B, N_slots, H, W]
