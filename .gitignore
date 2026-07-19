@@ -9,3 +9,5 @@ runs_data/
 *.pdf
 CLEVR_64/
 thesis_draft/
+*.tar.gz
+.claude/
