@@ -68,6 +68,7 @@ import matplotlib.pyplot as plt
 import mlflow
 
 from model import SlotODEModel
+from model_new import SlotODEModel as SlotODEModelNew
 from model_baseline import SlotAttentionModel
 from evaluate import compute_ari_fg
 
@@ -90,34 +91,42 @@ class Dataset:
         self.batch_size = batch_size
         self.shuffle = shuffle
 
-        img_dir = Path(data_dir) / 'images' / split
-        mask_dir = Path(data_dir) / 'masks' / split
-        vis_dir = Path(data_dir) / 'visibility' / split
+        npz_path = Path(data_dir) / f'{split}.npz'
+        if npz_path.exists():
+            print(f"  Loading {split} from {npz_path}...")
+            data = np.load(npz_path)
+            self.images = data['images']
+            self.masks = data['masks']
+            self.visibility = data['visibility']
+            self.n = self.images.shape[0]
+            print(f"  Done. {self.n} images, ~{self.images.nbytes / 1e9:.1f} GB in RAM")
+        else:
+            img_dir = Path(data_dir) / 'images' / split
+            mask_dir = Path(data_dir) / 'masks' / split
+            vis_dir = Path(data_dir) / 'visibility' / split
 
-        self.img_files = sorted(img_dir.glob('*.png'))
-        self.mask_files = sorted(mask_dir.glob('*.npy'))
-        self.vis_files = sorted(vis_dir.glob('*.npy'))
-        self.n = len(self.img_files)
-        assert self.n > 0, f"No images found in {img_dir}"
-        assert len(self.mask_files) == self.n, "Image/mask count mismatch"
+            self.img_files = sorted(img_dir.glob('*.png'))
+            self.mask_files = sorted(mask_dir.glob('*.npy'))
+            self.vis_files = sorted(vis_dir.glob('*.npy'))
+            self.n = len(self.img_files)
+            assert self.n > 0, f"No images found in {img_dir}"
+            assert len(self.mask_files) == self.n, "Image/mask count mismatch"
 
-        # determine resolution from first image
-        sample = np.array(Image.open(self.img_files[0]))
-        H, W = sample.shape[:2]
+            sample = np.array(Image.open(self.img_files[0]))
+            H, W = sample.shape[:2]
 
-        # preload everything into RAM
-        print(f"  Loading {split}: {self.n} images ({H}x{W})...")
-        self.images = np.zeros((self.n, 3, H, W), dtype=np.float32)
-        self.masks = np.zeros((self.n, 11, H, W), dtype=np.uint8)
-        self.visibility = np.zeros((self.n, 11), dtype=np.float32)
-        for i in range(self.n):
-            img = np.array(Image.open(self.img_files[i]))  # [H, W, 3] uint8
-            self.images[i] = img.transpose(2, 0, 1).astype(np.float32) / 127.5 - 1.0
-            self.masks[i] = np.load(self.mask_files[i])
-            self.visibility[i] = np.load(self.vis_files[i])
-            if (i + 1) % 10000 == 0:
-                print(f"    {i + 1}/{self.n}")
-        print(f"  Done. ~{self.images.nbytes / 1e9:.1f} GB in RAM")
+            print(f"  Loading {split}: {self.n} images ({H}x{W})...")
+            self.images = np.zeros((self.n, 3, H, W), dtype=np.float32)
+            self.masks = np.zeros((self.n, 11, H, W), dtype=np.uint8)
+            self.visibility = np.zeros((self.n, 11), dtype=np.float32)
+            for i in range(self.n):
+                img = np.array(Image.open(self.img_files[i]))
+                self.images[i] = img.transpose(2, 0, 1).astype(np.float32) / 127.5 - 1.0
+                self.masks[i] = np.load(self.mask_files[i])
+                self.visibility[i] = np.load(self.vis_files[i])
+                if (i + 1) % 10000 == 0:
+                    print(f"    {i + 1}/{self.n}")
+            print(f"  Done. ~{self.images.nbytes / 1e9:.1f} GB in RAM")
 
     def __iter__(self):
         idx = np.arange(self.n)
@@ -310,7 +319,7 @@ def load_checkpoint(path: str, model, optimizer):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train Slot Attention models on CLEVR-with-masks (JAX)")
-    p.add_argument("--model",          default="slot_ode", choices=["slot_ode", "baseline"])
+    p.add_argument("--model",          default="slot_ode", choices=["slot_ode", "slot_ode_new", "baseline"])
     p.add_argument("--data_dir",       default="CLEVR_64",
                    help="Path to pre-converted dataset (from convert_tfrecords.py)")
     p.add_argument("--resolution",     type=int,   default=64,
@@ -360,9 +369,10 @@ def train(args):
     val_ds = Dataset(args.data_dir, 'val', args.batch_size, shuffle=False)
 
     # ---- model ------------------------------------------------------------
-    if args.model == "slot_ode":
+    if args.model in ("slot_ode", "slot_ode_new"):
         dt0 = args.dt if args.dt is not None else 1.0
-        model = SlotODEModel(
+        cls = SlotODEModel if args.model == "slot_ode" else SlotODEModelNew
+        model = cls(
             resolution=(res, res), num_slots=args.num_slots,
             slot_dim=args.slot_dim, enc_hidden_dim=args.enc_hidden_dim,
             num_iter=args.num_iter, dt0=dt0,
@@ -373,13 +383,6 @@ def train(args):
             resolution=(res, res), num_slots=args.num_slots,
             slot_dim=args.slot_dim, enc_hidden_dim=args.enc_hidden_dim,
             num_iter=args.num_iter, key=model_key
-        )
-
-    # GPU: cast model to float16 to fit in VRAM (matches TPU's bfloat16 compute)
-    if jax.devices()[0].platform == "gpu":
-        model = jax.tree.map(
-            lambda x: x.astype(jnp.float16) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
-            model
         )
 
     n_params = sum(x.size for x in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
@@ -433,8 +436,6 @@ def train(args):
         while not done:
             for imgs, _, _ in train_ds:
                 imgs_jax = jnp.array(imgs)
-                if jax.devices()[0].platform == "gpu":
-                    imgs_jax = imgs_jax.astype(jnp.float16)
 
                 key, subkey = jax.random.split(key)
 

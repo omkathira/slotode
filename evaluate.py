@@ -273,6 +273,12 @@ def evaluate(args):
             key=key,
         )
 
+    if args.fp16:
+        model = jax.tree.map(
+            lambda x: x.astype(jnp.float16) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
+            model,
+        )
+
     model = eqx.tree_deserialise_leaves(args.ckpt, model)
     n_params = sum(p.size for p in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
     print(f"Model: {args.model} ({n_params:,} params)")
@@ -403,6 +409,8 @@ def parse_args():
                    help="Max number of images to evaluate on")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--fp16", action="store_true",
+                   help="Cast model to float16 before loading (for GPU-trained baseline ckpts)")
     return p.parse_args()
 
 

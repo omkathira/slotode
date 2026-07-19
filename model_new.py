@@ -28,7 +28,7 @@ slot attention as an autonomous neural ODE, no dependence on time: d(slots)/dt =
     gate = sigmoid([slots, f_attn] @ Wg)
 
 6. MLP update (like a transformer FFN, just a nonlinear transformation)
-    h = ReLU([slots, f_attn] @ Wf0)
+    h = ReLU(slots @ Wf0)
     h = h @ Wf1
 
 7. Final velocity
@@ -65,7 +65,7 @@ class SlotODEFunc(eqx.Module):
 
         self.W_q = jax.random.normal(k1, (slot_dim, slot_dim)) * (slot_dim ** -0.5)
         self.W_gate = jax.random.normal(k2, (slot_dim, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
-        self.W_ff0 = jax.random.normal(k3, (mlp_hidden, 2 * slot_dim)) * ((2 * slot_dim) ** -0.5)
+        self.W_ff0 = jax.random.normal(k3, (mlp_hidden, slot_dim)) * (slot_dim ** -0.5)
         self.W_ff1 = jax.random.normal(k4, (slot_dim, mlp_hidden)) * (mlp_hidden ** -0.5)
 
         self.norm_attn = eqx.nn.LayerNorm(slot_dim)
@@ -95,8 +95,7 @@ class SlotODEFunc(eqx.Module):
 
         # residual MLP
         slots_ff = jax.vmap(jax.vmap(self.norm_ff))(slots)
-        ff_input = jnp.concatenate([slots_ff, f_attn], axis=-1)
-        h = jnp.einsum('bnd,od->bno', ff_input, self.W_ff0)
+        h = jnp.einsum('bnd,od->bno', slots_ff, self.W_ff0)
         h = jax.nn.relu(h)
         h = jnp.einsum('bnd,od->bno', h, self.W_ff1)
 
